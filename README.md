@@ -1,2 +1,3 @@
-# neurocache
-Neurocache: A library for augmenting language models with external caching mechanisms
+# Neurocache
+
+A library for augmenting language models with external caching mechanisms
