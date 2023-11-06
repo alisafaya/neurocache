@@ -1,8 +1,24 @@
 
-<h1 align="center"> <p>Neurocache</p></h1>
+<h1 align="center">Neurocache</h1>
 <h3 align="center">
-    <p>State-of-the-art Parameter-Efficient Fine-Tuning (PEFT) methods</p>
+  A library for augmenting language models with external caching mechanisms 
 </h3>
+
+<a href="https://github.com/alisafaya/neurocache/releases">
+  <img alt="GitHub release" src="https://img.shields.io/github/release/alisafaya/neurocache.svg">
+</a>
+
+## Requirements
+
+* Python 3.6+
+* PyTorch 1.13.0+
+* Transformers 4.25.0+
+
+## Installation
+
+```bash
+pip install neurocache
+```
 
 ## Getting started
 
@@ -38,8 +54,16 @@ tokenized_input["start_of_sequence"] = torch.tensor([0, 1]).bool()
 outputs = model(**tokenized_input)
 ```
 
-## Installation
+## Supported model types
 
-```bash
-pip install neurocache
+```
+from neurocache.utils import NEUROCACHE_SUPPORTED_MODELS
+print(NEUROCACHE_SUPPORTED_MODELS)
+
+[
+  "opt",
+  "llama",
+  "mistral",
+  "gptj",
+]
 ```
