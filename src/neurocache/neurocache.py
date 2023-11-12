@@ -62,9 +62,16 @@ class CacheAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.init_proj_weights(get_attribute(base_decoder_layer, "self_attn"))
+        self._init_proj_weights(get_attribute(base_decoder_layer, "self_attn"))
+        # self.apply(self._weight_init)
 
-    def init_proj_weights(self, self_attn_module):
+    @torch.no_grad()
+    def _weight_init(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=module.in_features**-0.5)
+
+    @torch.no_grad()
+    def _init_proj_weights(self, self_attn_module):
         """Initialize projection weights with self attention weights."""
         self.q_proj.weight.data = get_attribute(self_attn_module, "q_proj").weight.data.clone()
         self.o_proj.weight.data = get_attribute(self_attn_module, "o_proj").weight.data.clone()
@@ -107,7 +114,12 @@ class CacheAttention(nn.Module):
 
         # Compute attention weights.
         ext_attn = torch.einsum("...qhd,...qhid->...hqi", queries, external_keys)
-        ext_attn = nn.functional.softmax(ext_attn, dim=-1, dtype=torch.float32).to(queries.dtype)
+        if ext_attn.dtype == torch.float16:
+            ext_attn = nn.functional.softmax(ext_attn, dim=-1, dtype=torch.float32).to(
+                torch.float16
+            )
+        else:
+            ext_attn = nn.functional.softmax(ext_attn, dim=-1)
 
         # Compute weighted sum of values.
         attn_output = torch.einsum("...hqi,...qhid->...qhd", ext_attn, external_values)
@@ -210,6 +222,15 @@ class Neurocache(nn.Module):
             self.h_norm = nn.Identity()
             self.cache_dim = self.hidden_size
 
+        if config.cache_dtype == "bfloat16":
+            self.cache_dtype = torch.bfloat16
+        elif config.cache_dtype == "float16":
+            self.cache_dtype = torch.float16
+        elif config.cache_dtype == "float32":
+            self.cache_dtype = torch.float32
+        else:
+            raise ValueError("Invalid cache dtype: {}".format(config.cache_dtype))
+
         self.retrieval_state = {}
         self.cache_attns = nn.ModuleList([])
         self.caches = nn.ModuleList([])
@@ -231,6 +252,15 @@ class Neurocache(nn.Module):
         self.cache_attns = nn.ModuleList([])
         self.hooks = []
 
+    def should_reencode(self):
+        """Check if retrieved cache should be re-encoded."""
+        return (
+            not self.config.inference_mode
+            and self.training
+            and self.config.neurocache_type == NeurocacheType.ONDEVICE
+            and self.config.compression_factor > 1
+        )
+
     def reinitialize_cache(self):
         """Reinitialize cache.
         This can be used to change the batch size of the cache.
@@ -241,6 +271,9 @@ class Neurocache(nn.Module):
 
     def _register_hooks(self, base_model: PreTrainedModel):
         # Infer decoder layer list
+        if hasattr(base_model, "base_model"):
+            base_model = base_model.model
+
         if hasattr(base_model, "model"):
             base_model = base_model.model
 
@@ -251,14 +284,13 @@ class Neurocache(nn.Module):
         num_layers = len(layers)
 
         if self.config.cache_layers is None or len(self.config.cache_layers) == 0:
-            cache_layers = [
-                num_layers * 3 // 4,
-            ]
+            cache_idx = num_layers * 3 // 4
+            cache_layers = [cache_idx]
         else:
             cache_layers = self.config.cache_layers
 
         if self.config.attention_layers is None or len(self.config.attention_layers) == 0:
-            attention_layers = range(cache_layers, num_layers)
+            attention_layers = list(range(min(cache_layers), num_layers))
         else:
             attention_layers = self.config.attention_layers
 
@@ -309,25 +341,30 @@ class Neurocache(nn.Module):
             return
 
         hs = kwargs["hidden_states"].detach()
+        batch_size, seq_len, hidden_size = hs.shape
 
         # TODO: Infer padding mask from attention mask
         input_mask = None
 
-        # Project hidden states to lower dimension and normalize
+        # Project hidden states to lower dimension and normalize these
+        # will be used as queries for the cache and as values to be
+        # stored in the cache
+        # This is always done without gradients, even during training
+        # since we do not backpropagate through the cache.
         with torch.no_grad():
-            phs = self.h_norm(self.h_proj(hs))
+            phs = self.h_norm(self.h_proj(hs)).to(self.cache_dtype)
 
         # 1. Retrieve topk neighbors from cache
 
         # Since we need to infer the batch size before initializing
         # the cache we initialize the cache in the first forward pass
-        # and retrieve in the second forward pass
+        # and start retrieval in the next passes.
         if (
             self.caches[idx].wrapped is None
             and self.config.neurocache_type == NeurocacheType.ONDEVICE
         ):
-            batch_size = hs.shape[0]
-            value_dim = hs.shape[-1] if (self.training and not self.config.inference_mode) else 0
+            value_dim = hidden_size if self.should_reencode() else 0
+
             self.caches[idx].wrapped = OnDeviceCache(
                 batch_size,
                 self.config.cache_size,
@@ -335,36 +372,37 @@ class Neurocache(nn.Module):
                 value_dim,
                 self.config.neighborhood_size,
                 self.config.similarity_fn,
-                dtype=phs.dtype,
+                dtype=self.cache_dtype,
                 ordering=self.config.cache_type,
-            )
+            ).to(phs.device)
 
-            # return zeros since cache is empty
+            ext_hs_dim = value_dim if self.should_reencode() else self.cache_dim
             ext_hs = torch.zeros(
                 batch_size,
-                hs.shape[1],
-                self.config.topk,
-                self.cache_dim,
+                seq_len,
+                self.config.topk * self.config.neighborhood_size,
+                ext_hs_dim,
                 dtype=hs.dtype,
-            )
+            ).to(phs.device)
 
+        # Else if the cache is already initialized retrieve from cache
         else:
             # retrieve topk neighbors from cache
             assert self.caches[idx].wrapped is not None
-            assert (
-                self.caches[idx].wrapped.num_caches == hs.shape[0] or self.config.global_cache
-            ), (
+            assert self.caches[idx].wrapped.num_caches == batch_size or self.config.global_cache, (
                 "Cache batch size does not match hidden states batch size. "
                 "Please re-initalize Neurocache."
             )
 
-            keys, values = self.caches[idx].topk_retrieval(phs, input_mask, self.config.topk)
+            with torch.no_grad():
+                keys, values = self.caches[idx].topk_retrieval(phs, input_mask, self.config.topk)
+                ext_hs = values if self.should_reencode() else keys
+                assert ext_hs is not None, "Retrieved cache is None"
+                ext_hs = ext_hs.to(hs.dtype)
 
-            if self.training and not self.config.inference_mode:
-                # re-project retrieved values to train h_proj and h_norm layers
-                ext_hs = self.h_norm(self.h_proj(values))
-            else:
-                ext_hs = keys
+        if self.should_reencode():
+            # re-project retrieved values to train h_proj and h_norm layers
+            ext_hs = self.h_norm(self.h_proj(ext_hs))
 
         # Store retrieved states for attention in following layers
         self.retrieval_state["ext_hidden_states"] = ext_hs
@@ -374,7 +412,7 @@ class Neurocache(nn.Module):
         # If training keep both projected and original hidden states
         # to train the h_proj and h_norm layers, otherwise keep only
         # projected hidden states
-        if self.config.inference_mode or not self.training:
+        if self.should_reencode():
+            self.caches[idx].update(phs, hs.to(self.cache_dtype), input_mask)
+        else:
             self.caches[idx].update(phs, None, input_mask)
-        elif self.config.neurocache_type == NeurocacheType.ONDEVICE:
-            self.caches[idx].update(phs, hs, input_mask)

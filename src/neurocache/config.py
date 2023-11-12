@@ -189,6 +189,7 @@ class NeurocacheConfig(NeurocacheConfigMixin):
     )
     inference_mode: bool = field(default=False, metadata={"help": "Whether to use inference mode"})
     cache_size: int = field(default=8192, metadata={"help": "The size of the cache (tokens)"})
+    cache_dtype: str = field(default="float32", metadata={"help": "The dtype of the cache"})
     compression_factor: int = field(
         default=8, metadata={"help": "The compression factor of the cache"}
     )

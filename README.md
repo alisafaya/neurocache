@@ -56,7 +56,7 @@ outputs = model(**tokenized_input)
 
 ## Supported model types
 
-```
+```python
 from neurocache.utils import NEUROCACHE_SUPPORTED_MODELS
 print(NEUROCACHE_SUPPORTED_MODELS)
 

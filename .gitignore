@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.ruff_cache
 build/
 bin/
 develop-eggs/

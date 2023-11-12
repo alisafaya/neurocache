@@ -199,6 +199,7 @@ class OnDeviceCache(Cache):
             update_indices = (
                 torch.arange(new_values.shape[1], device=start_index.device) + start_index[:, None]
             )  # (num_caches, num_kv)
+            update_indices = update_indices % cache_size
             cache.scatter_(1, update_indices[..., None].expand_as(new_values), new_values)
         elif self.ordering == "LRU":
             # LRU: overwrite least recently used entries first
@@ -221,11 +222,7 @@ class OnDeviceCache(Cache):
         assert key_features == self.key_features
 
         key = torch.moveaxis(key, source=1, destination=0)  # split by cache
-
-        # start_index can be larger than DB - we use that to detect which entries
-        # are not written to yet
-        start_index = self.db_index % self.cache_size
-        self.update_kv_cache_(self.key_db, key, start_index)
+        self.update_kv_cache_(self.key_db, key, self.db_index)
 
         if value is not None:
             value = value.detach().to(self.value_db.device)
@@ -236,7 +233,7 @@ class OnDeviceCache(Cache):
             else:
                 assert value.ndim == 3
             value = torch.moveaxis(value, source=1, destination=0)  # split by cache
-            self.update_kv_cache_(self.value_db, value, start_index)
+            self.update_kv_cache_(self.value_db, value, self.db_index)
 
         self.db_index = self.db_index + num_kv
         return 0

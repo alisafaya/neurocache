@@ -71,7 +71,7 @@ class NeurocacheModel(PushToHubMixin, torch.nn.Module):
         self.neurocache_config = neurocache_config
         self.base_cache = Neurocache(model, neurocache_config)
 
-        self._mark_only_neurocache_as_trainable()
+        self._mark_neurocache_as_trainable()
 
         # handle gradient checkpointing
         if getattr(model, "is_gradient_checkpointing", True):
@@ -233,7 +233,8 @@ class NeurocacheModel(PushToHubMixin, torch.nn.Module):
         trainable_params, all_param = self.get_nb_trainable_parameters()
 
         print(
-            f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
+            f"trainable params: {trainable_params:,d} || all params: {all_param:,d}"
+            f" || trainable%: {100 * trainable_params / all_param}"
         )
 
     def __getattr__(self, name: str):
@@ -263,10 +264,10 @@ class NeurocacheModel(PushToHubMixin, torch.nn.Module):
         Disables neurocache.
         """
         try:
-            self.base_cache._remove_hooks()
+            self.base_cache.disable()
             yield
         finally:
-            self.base_cache._register_hooks
+            self.base_cache.enable()
 
     def get_base_model(self):
         """
@@ -311,10 +312,7 @@ class NeurocacheModel(PushToHubMixin, torch.nn.Module):
     def base_model_torch_dtype(self):
         return getattr(self.base_model, "dtype", None)
 
-    def _mark_only_neurocache_as_trainable(self) -> None:
-        for n, p in self.base_model.named_parameters():
-            p.requires_grad = False
-
+    def _mark_neurocache_as_trainable(self) -> None:
         for n, p in self.base_cache.named_parameters():
             p.requires_grad = True
 
