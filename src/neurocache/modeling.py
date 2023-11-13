@@ -96,7 +96,6 @@ class NeurocacheModel(PushToHubMixin, torch.nn.Module):
         self,
         save_directory: str,
         safe_serialization: bool = False,
-        **kwargs: Any,
     ):
         r"""
         This function saves the neurocache weights and the configuration files to a
@@ -114,10 +113,7 @@ class NeurocacheModel(PushToHubMixin, torch.nn.Module):
             raise ValueError(f"Provided path ({save_directory}) should be a directory, not a file")
 
         # save only the trainable weights
-        output_state_dict = get_neurocache_model_state_dict(
-            self,
-            state_dict=kwargs.get("state_dict", None),
-        )
+        output_state_dict = get_neurocache_model_state_dict(self)
         os.makedirs(save_directory, exist_ok=True)
 
         if safe_serialization:

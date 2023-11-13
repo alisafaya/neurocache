@@ -68,7 +68,7 @@ config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM",
 )
-model = inject_adapter_in_model(config, model)
+model = inject_adapter_in_model(config, model, adapter_name="neurocache")
 
 """
 Set up the neurocache config and wrap the model with the neurocache model.
@@ -116,7 +116,7 @@ trainer = transformers.Trainer(
         per_device_train_batch_size=4,
         gradient_accumulation_steps=1,
         warmup_steps=100,
-        max_steps=1000,
+        max_steps=100,
         learning_rate=1e-4,
         fp16=True,
         logging_steps=10,
@@ -129,9 +129,5 @@ trainer.train()
 """
 Save the adapters and the weights of the cache.
 """
-
-import ipdb
-
-
-ipdb.set_trace()
-# model.save_pretrained("./outputs/opt_peft_model")
+model.save_pretrained("./opt_peft_model")
+model = NeurocacheModelForCausalLM.from_pretrained(model, "./opt_peft_model")

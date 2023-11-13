@@ -47,15 +47,15 @@ options:
 Example:
 
 ```bash
-python train_neurocache.py \
-    --output_dir bin/test \
-    --model_name_or_path facebook/opt-125m \
+accelerate launch --mixed_precision fp16 \
+    train_neurocache.py --output_dir /localscratch/proj12/nc/baseline_opt350m/ \
+    --model_name_or_path facebook/opt-350m \
     --dataset_name long_pile:1.1.0 \
-    --per_device_batch_size 4 \
-    --gradient_accumulation_steps 8 \
-    --max_train_steps 1000 \
-    --num_warmup_steps 100 \
-    --seed 1234567 \
-    --sequence_length 256 \
-    --checkpointing_steps 250
+    --sequence_length 1024 \
+    --max_eval_steps 1000 \
+    --evaluate_every_steps 1000 \
+    --checkpointing_steps 5000 \
+    --with_tracking \
+    --gradient_accumulation_steps 4 \
+    --per_device_batch_size 8 &> /localscratch/proj12/nc/baseline_opt350m/log.txt &
 ``` 

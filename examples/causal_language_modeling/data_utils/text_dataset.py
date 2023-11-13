@@ -578,7 +578,7 @@ def split_and_batch(
             logging.info("Reading article: %s", pretty_print_article(article, {}))
         else:
             logging.log_every_n_seconds(
-                logging.INFO, "Reading article: %s", 120, pretty_print_article(article, {})
+                logging.INFO, "Reading article: %s", 600, pretty_print_article(article, {})
             )
         tokens = extract_fn(article)
         if isinstance(tokens, str) or isinstance(tokens, bytes):

@@ -67,3 +67,11 @@ print(NEUROCACHE_SUPPORTED_MODELS)
   "gptj",
 ]
 ```
+
+## TODO
+
+- [ ] Benchmark the implementation and identify bottlenecks.
+- [ ] Test save and load pre-trained weights with the adapters.
+- [ ] Add support for more models and for grouped query attention (for Mistral and Larger LLaMA models).
+- [ ] Add chunked storage function for generation (enables processing prompts of arbitrary length).
+- [ ] Add support for masking padding tokens in the cache (required for global cache only).

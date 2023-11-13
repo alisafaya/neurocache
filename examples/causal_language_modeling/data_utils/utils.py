@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -43,7 +44,8 @@ class TrainingTaskConfig:
 
 class LongTextDataset(IterableDataset):
     def __init__(self, task_config, split, total_bsz, **kwargs):
-        self.ds, self.vocab = load_text_dataset(
+        self.ds_loader = functools.partial(
+            load_text_dataset,
             split=split,
             sequential=True,
             name=task_config.dataset_name,
@@ -52,9 +54,13 @@ class LongTextDataset(IterableDataset):
             seed=task_config.seed,
             **kwargs,
         )
+        self.ds = None
         self.ds_iter = None
+        self.vocab = None
 
     def __iter__(self):
+        if self.ds is None:
+            self.ds, self.vocab = self.ds_loader()
         self.ds_iter = self.ds.as_numpy_iterator()
         return self
 

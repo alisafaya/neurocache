@@ -49,26 +49,32 @@ def initialize_model(args, accelerator):
         low_cpu_mem_usage=args.low_cpu_mem_usage,
     )
 
+    # Set up the neurocache config and wrap the model with the neurocache model.
+    if args.cache_layers is not None:
+        cache_layers = [int(x) for x in args.cache_layers.split(",")]
+    else:
+        cache_layers = [model.config.num_hidden_layers * 3 // 4]
+
+    if args.attention_layers is not None:
+        attention_layers = [int(x) for x in args.attention_layers.split(",")]
+    else:
+        attention_layers = list(range(min(cache_layers), model.config.num_hidden_layers))
+
     # Apply LoRA only to the main model.
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         target_modules=["fc1", "fc2"],
         lora_dropout=args.lora_dropout,
+        layers_to_transform=attention_layers,
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = inject_adapter_in_model(lora_config, model, "neurocache")
 
-    # Set up the neurocache config and wrap the model with the neurocache model.
-    if args.cache_layers is not None:
-        args.cache_layers = [int(x) for x in args.cache_layers.split(",")]
-    if args.attention_layers is not None:
-        args.attention_layers = [int(x) for x in args.attention_layers.split(",")]
-
     neurocache_config = OnDeviceCacheConfig(
-        attention_layers=args.attention_layers,
-        cache_layers=args.cache_layers,
+        attention_layers=attention_layers,
+        cache_layers=cache_layers,
         cache_size=args.cache_size,
         cache_dtype=args.cache_dtype,
         compression_factor=args.compression_factor,
@@ -78,8 +84,8 @@ def initialize_model(args, accelerator):
     )
     model = NeurocacheModelForCausalLM(model, neurocache_config)
 
-    accelerator.print(lora_config.to_dict())
-    accelerator.print(neurocache_config.to_dict())
+    logger.info(f"LoRA Config: {lora_config}")
+    logger.info(f"Neurocache Config: {neurocache_config}")
 
     print_trainable_parameters(model, accelerator)
 
@@ -144,14 +150,19 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
 
     model.eval()
     losses = []
-    for step, batch in tqdm(
-        enumerate(dataloader),
-        desc="Evaluating",
-        total=args.max_eval_steps if args.max_eval_steps > 0 else None,
-    ):
+    progress_bar = tqdm(
+        range(args.max_eval_steps if args.max_eval_steps > 0 else None),
+        disable=not accelerator.is_local_main_process,
+    )
+
+    for step, batch in enumerate(dataloader):
         with torch.no_grad():
             target_ids = batch.pop("labels")
             epoch = batch.pop("epochs")[0].item()
+
+            if not isinstance(model, NeurocacheModelForCausalLM):
+                batch.pop("start_of_sequence")
+
             outputs = model(**batch)
             loss = F.cross_entropy(
                 outputs.logits.view(-1, outputs.logits.size(-1)).to(torch.float32),
@@ -165,6 +176,8 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
 
         if epoch > 0:
             logger.warning("Epoch > 0 for evaluation, this is unexpected.")
+
+        progress_bar.update(1)
 
     eval_loss = torch.cat(losses).mean().item()
     bits_per_token, perplexity = calculate_metrics(eval_loss)
@@ -183,6 +196,7 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
             step=global_step,
         )
 
+    model.train()
     return eval_loss, bits_per_token, perplexity
 
 
@@ -201,6 +215,7 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         dispatch_batches=True,
+        split_batches=True,
         **accelerator_log_kwargs,
     )
 
@@ -402,7 +417,6 @@ def main():
                     break
 
     # Final evaluation
-    run_evaluation(args, model, eval_dataloader, accelerator, completed_steps, prefix="eval")
     run_evaluation(args, model, test_dataloader, accelerator, completed_steps, prefix="test")
 
     if args.with_tracking:
@@ -412,11 +426,8 @@ def main():
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save,
-        )
+        if accelerator.is_main_process:
+            unwrapped_model.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":

@@ -286,11 +286,13 @@ class Neurocache(nn.Module):
         if self.config.cache_layers is None or len(self.config.cache_layers) == 0:
             cache_idx = num_layers * 3 // 4
             cache_layers = [cache_idx]
+            self.config.cache_layers = cache_layers
         else:
             cache_layers = self.config.cache_layers
 
         if self.config.attention_layers is None or len(self.config.attention_layers) == 0:
             attention_layers = list(range(min(cache_layers), num_layers))
+            self.config.attention_layers = attention_layers
         else:
             attention_layers = self.config.attention_layers
 
@@ -351,8 +353,7 @@ class Neurocache(nn.Module):
         # stored in the cache
         # This is always done without gradients, even during training
         # since we do not backpropagate through the cache.
-        with torch.no_grad():
-            phs = self.h_norm(self.h_proj(hs)).to(self.cache_dtype)
+        phs = self.h_norm(self.h_proj(hs)).to(self.cache_dtype).detach()
 
         # 1. Retrieve topk neighbors from cache
 
