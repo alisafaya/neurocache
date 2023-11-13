@@ -6,6 +6,7 @@ on a text file or a dataset without using HuggingFace Trainer.
 import logging
 import math
 import os
+import shutil
 
 import tensorflow.compat.v2 as tf
 import torch
@@ -13,8 +14,6 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import recursively_apply, set_seed
-from config_args import parse_args
-from data_utils import utils as dutils
 from peft import (
     LoraConfig,
     inject_adapter_in_model,
@@ -27,6 +26,8 @@ from transformers import (
     AutoModelForCausalLM,
     get_scheduler,
 )
+from utils import data_utils as dutils
+from utils.args import parse_args
 
 from neurocache import NeurocacheModelForCausalLM, OnDeviceCacheConfig
 
@@ -60,35 +61,36 @@ def initialize_model(args, accelerator):
     else:
         attention_layers = list(range(min(cache_layers), model.config.num_hidden_layers))
 
-    # Apply LoRA only to the main model.
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["fc1", "fc2"],
-        lora_dropout=args.lora_dropout,
-        layers_to_transform=attention_layers,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = inject_adapter_in_model(lora_config, model, "neurocache")
+    if not args.disable_lora:
+        # Apply LoRA to the main model to adapt it to using neurocache.
+        lora_layers = attention_layers if args.lora_upper_layers else None
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=["fc1", "fc2"],
+            lora_dropout=args.lora_dropout,
+            layers_to_transform=lora_layers,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        logger.info(f"LoRA Config: {lora_config}")
+        model = inject_adapter_in_model(lora_config, model, "neurocache")
 
-    neurocache_config = OnDeviceCacheConfig(
-        attention_layers=attention_layers,
-        cache_layers=cache_layers,
-        cache_size=args.cache_size,
-        cache_dtype=args.cache_dtype,
-        compression_factor=args.compression_factor,
-        neighborhood_size=args.neighborhood_size,
-        context_size=args.context_size,
-        topk=args.topk,
-    )
-    model = NeurocacheModelForCausalLM(model, neurocache_config)
-
-    logger.info(f"LoRA Config: {lora_config}")
-    logger.info(f"Neurocache Config: {neurocache_config}")
+    if not args.disable_neurocache:
+        neurocache_config = OnDeviceCacheConfig(
+            attention_layers=attention_layers,
+            cache_layers=cache_layers,
+            cache_size=args.cache_size,
+            cache_dtype=args.cache_dtype,
+            compression_factor=args.compression_factor,
+            neighborhood_size=args.neighborhood_size,
+            context_size=args.context_size,
+            topk=args.topk,
+        )
+        model = NeurocacheModelForCausalLM(model, neurocache_config)
+        logger.info(f"Neurocache Config: {neurocache_config}")
 
     print_trainable_parameters(model, accelerator)
-
     return model
 
 
@@ -118,11 +120,11 @@ def print_trainable_parameters(model, accelerator):
     )
 
 
-def initialize_dataloader(args, task_config, split, accelerator):
+def initialize_dataloader(args, task_config, split, accelerator, resume_step=0):
     distributed_batch_size = args.per_device_batch_size * accelerator.num_processes
     per_device_batch_size = args.per_device_batch_size
 
-    dataset = dutils.LongTextDataset(task_config, split, distributed_batch_size)
+    dataset = dutils.LongTextDataset(task_config, split, distributed_batch_size, skip=resume_step)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, pin_memory=True)
 
     def slice_fn(data, tensor_slice, process_index=None, num_processes=None):
@@ -276,9 +278,6 @@ def main():
     )
 
     # Initialize the datasets
-    train_dataloader = initialize_dataloader(
-        args, task_config, task_config.train_split, accelerator
-    )
     eval_dataloader = initialize_dataloader(args, task_config, task_config.eval_split, accelerator)
     test_dataloader = initialize_dataloader(args, task_config, task_config.test_split, accelerator)
 
@@ -306,55 +305,39 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-    starting_epoch = 0
 
     # Potentially load in the weights and states from a previous save
+    completed_steps, resume_step = 0, 0
     if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            checkpoint_path = args.resume_from_checkpoint
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-            checkpoint_path = path
-            path = os.path.basename(checkpoint_path)
+        checkpoint_path = args.resume_from_checkpoint.rstrip("/")
 
+        accelerator.load_state(checkpoint_path)
         accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        accelerator.load_state(path)
-
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
 
         # need to multiply `gradient_accumulation_steps` to reflect real steps
+        training_difference = os.path.splitext(os.path.basename(checkpoint_path))[0]
         resume_step = (
             int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
         )
-        starting_epoch = resume_step // len(train_dataloader)
-        resume_step -= starting_epoch * len(train_dataloader)
         completed_steps = resume_step // args.gradient_accumulation_steps
 
     # update the progress_bar if load from checkpoint
     if not args.only_evaluate:
+        train_dataloader = initialize_dataloader(
+            args, task_config, task_config.train_split, accelerator, resume_step=resume_step
+        )
+
         progress_bar.update(completed_steps)
 
         model.train()
-        if args.resume_from_checkpoint == starting_epoch and resume_step is not None:
-            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
-        else:
-            active_dataloader = train_dataloader
-
-        if args.with_tracking:
-            logging_loss = 0
-            logging_steps = 0
-
-        for step, batch in enumerate(active_dataloader):
+        logging_loss, logging_steps = 0, 0
+        for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 target_ids = batch.pop("labels")
                 epoch = batch.pop("epochs")[0].item()
+
+                if not isinstance(model, NeurocacheModelForCausalLM):
+                    batch.pop("start_of_sequence")
 
                 # Forward pass
                 outputs = model(**batch)
@@ -371,9 +354,8 @@ def main():
                 optimizer.zero_grad()
 
                 # Logging
-                if args.with_tracking:
-                    logging_loss += loss.detach().float()
-                    logging_steps += 1
+                logging_loss += loss.detach().float()
+                logging_steps += 1
 
             # Checks if the accelerator has performed
             # an optimization step behind the scenes
@@ -381,20 +363,29 @@ def main():
                 progress_bar.update(1)
                 completed_steps += 1
 
-                if args.with_tracking and completed_steps % args.logging_steps == 0:
+                if completed_steps % args.logging_steps == 0:
                     bits_per_token, perplexity = calculate_metrics(logging_loss / logging_steps)
-                    accelerator.log(
-                        {
-                            "train_perplexity": perplexity,
-                            "train_bits_per_token": bits_per_token,
-                            "train_loss": logging_loss / logging_steps,
-                            "train_epoch": epoch,
-                            "train_lr": optimizer.param_groups[0]["lr"],
-                        },
-                        step=completed_steps,
+                    # Log metrics with formatting floats
+                    progress_bar.set_description(
+                        f"step {completed_steps:5d}, "
+                        f"train_loss = {logging_loss / logging_steps:.4f}, "
+                        f"train_perplexity = {perplexity:.4f}, "
+                        f"learning_rate = {optimizer.param_groups[0]['lr']:.4e}"
                     )
+
+                    if args.with_tracking:
+                        accelerator.log(
+                            {
+                                "train_perplexity": perplexity,
+                                "train_bits_per_token": bits_per_token,
+                                "train_loss": logging_loss / logging_steps,
+                                "train_epoch": epoch,
+                                "train_lr": optimizer.param_groups[0]["lr"],
+                            },
+                            step=completed_steps,
+                        )
+
                     logging_steps, logging_loss = 0, 0
-                    logger.info(f"global_step: {completed_steps}, perplexity: {perplexity}")
 
                 if completed_steps % args.evaluate_every_steps == 0:
                     run_evaluation(
@@ -409,9 +400,22 @@ def main():
                 # Save model checkpoint
                 if completed_steps % args.checkpointing_steps == 0:
                     output_dir = f"step_{completed_steps}"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
+                    output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
+
+                    # keep only last n checkpoints
+                    if args.keep_n_checkpoints is not None:
+                        checkpoint_paths = [
+                            os.path.join(args.output_dir, path)
+                            for path in os.listdir(args.output_dir)
+                            if path.startswith("step_")
+                        ]
+                        checkpoint_paths = sorted(
+                            checkpoint_paths, key=lambda path: int(path.split("_")[-1])
+                        )
+                        for ckpt in checkpoint_paths[: -args.keep_n_checkpoints]:
+                            logger.info(f"Removing old checkpoint: {ckpt}")
+                            shutil.rmtree(ckpt)
 
                 if completed_steps >= args.max_train_steps:
                     break

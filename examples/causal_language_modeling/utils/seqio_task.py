@@ -6,7 +6,7 @@ from typing import Mapping, Optional, Set
 import seqio
 import tensorflow as tf
 
-from data_utils import bos
+from utils import bos
 
 
 def rekey_articles(

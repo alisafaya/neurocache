@@ -42,13 +42,15 @@ def parse_args():
 
     # Output arguments
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default="")
     parser.add_argument("--checkpointing_steps", type=int, default=5000)
+    parser.add_argument("--keep_n_checkpoints", type=int, default=3)
     parser.add_argument("--logging_steps", type=int, default=200)
     parser.add_argument("--report_to", type=str, default="tensorboard")
     parser.add_argument("--with_tracking", action="store_true")
 
     # Neurocache arguments
+    parser.add_argument("--disable_neurocache", action="store_true")
     parser.add_argument("--attention_layers", type=str, default=None)
     parser.add_argument("--cache_layers", type=str, default=None)
     parser.add_argument("--cache_size", type=int, default=8192)
@@ -61,6 +63,8 @@ def parse_args():
     parser.add_argument("--topk", type=int, default=32)
 
     # LoRA arguments
+    parser.add_argument("--disable_lora", action="store_true")
+    parser.add_argument("--lora_upper_layers", action="store_true")
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)

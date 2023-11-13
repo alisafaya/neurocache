@@ -1,4 +1,5 @@
 import torch
+from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from neurocache import (
@@ -47,9 +48,6 @@ tokenized_input["start_of_sequence"] = torch.tensor([0, 1]).bool()
 tokenized_input = {k: v.to("cuda") for k, v in tokenized_input.items()}
 
 model.reinitialize_cache()
-
-from tqdm import trange
-
 
 model.eval()
 with torch.no_grad():

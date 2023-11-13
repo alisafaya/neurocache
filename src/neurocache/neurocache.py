@@ -132,7 +132,6 @@ class CacheAttention(nn.Module):
             3. Repeat neighbors for each query if context size > 1.
             4. Compute attention over keys and values.
             5. Project attention outputs back to hidden states.
-            6. Residual connection with hidden states.
 
         Args:
             hidden_states: output of the previous layer.
@@ -181,9 +180,6 @@ class CacheAttention(nn.Module):
         # Project attention outputs back to hidden states.
         attn_output = attn_output.view(batch_size, seq_len, hidden_size)
         attn_output = self.o_proj(attn_output)
-
-        # Residual connection with hidden states.
-        attn_output = attn_output + hidden_states
         return attn_output
 
 
@@ -305,7 +301,7 @@ class Neurocache(nn.Module):
             split_dims = () if self.config.global_cache else (0,)
             self.caches.append(BatchedCache(None, split_dims))
             hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
-                functools.partial(self.retrieve_hook, idx=i), with_kwargs=True
+                functools.partial(self.retrieve_hook, idx=i), prepend=True, with_kwargs=True
             )
             hooks.append(hook)
 
@@ -332,9 +328,11 @@ class Neurocache(nn.Module):
         if not self.enabled:
             return
 
-        hs = kwargs["hidden_states"]
-        ext_hs = self.retrieval_state["ext_hidden_states"]
-        outputs = (self.cache_attns[idx](hs, ext_hs),) + outputs[1:]
+        # Residual connection with previous self attention
+        residual = outputs[0] + self.cache_attns[idx](
+            kwargs["hidden_states"], self.retrieval_state["ext_hidden_states"]
+        )
+        outputs = (residual,) + outputs[1:]
         return outputs
 
     def retrieve_hook(self, module, args, kwargs, outputs, idx):
