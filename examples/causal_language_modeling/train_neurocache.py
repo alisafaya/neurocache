@@ -14,41 +14,126 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import recursively_apply, set_seed
-from peft import (
-    LoraConfig,
-    inject_adapter_in_model,
-)
+from peft import LoraConfig, inject_adapter_in_model, prepare_model_for_kbit_training
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 from transformers import (
     MODEL_MAPPING,
     AutoConfig,
     AutoModelForCausalLM,
+    BitsAndBytesConfig,
     get_scheduler,
 )
 from utils import data_utils as dutils
 from utils.args import parse_args
 
 from neurocache import NeurocacheModelForCausalLM, OnDeviceCacheConfig
+from neurocache.neurocache import get_attribute
 
 
 # Make sure that tensorflow is not reserving GPUs.
 tf.config.experimental.set_visible_devices([], "GPU")
+
 
 logger = get_logger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 
 
+def init_neurocache_weights_(args, neurocache):
+    _model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        config=AutoConfig.from_pretrained(
+            args.model_name_or_path,
+        ),
+    )
+
+    if hasattr(_model, "base_model"):
+        _model = _model.model
+    if hasattr(_model, "model"):
+        _model = _model.model
+    if hasattr(_model, "decoder"):
+        _model = _model.decoder
+    layers = get_attribute(_model, "layers")
+
+    for i, idx in enumerate(neurocache.config.attention_layers):
+        self_attn_module = get_attribute(layers[idx], "self_attn")
+        neurocache.cache_attns[i]._init_proj_weights(self_attn_module)
+
+    del _model
+
+
+def prevent_full_backward_pass(_model):
+    """
+    Allow gradient checkpointing while preventing full backward pass on the model.
+    """
+
+    # Prevent full backward pass on the model. This is a workaround for the issue that
+    # the full backward pass on the model will cause the memory and GPU usage to increase.
+
+    # This is required because the default implementation of transformers does checkpointing
+    # on all of the layers by default. This cause the backward pass to be done on all of the
+    # layers, which is not necessary for our use case.
+
+    # We fix this by enabling gradient checkpointing on the model, and then detaching the
+    # output of the bottom layer. This will prevent the backward pass from propagating to
+    # the bottom layer, and thus prevent the full backward pass on the model.
+
+    # Note: this does not work by default due to PyTorch checkpoint function default use_reentrant
+    # parameter to be True. We modify it to false in the transformers library.
+    # modeling_utils.py:
+    # After this line:
+    # from torch.utils.checkpoint import checkpoint
+    # Add this line:
+    # checkpoint = functools.partial(checkpoint, use_reentrant=False)
+
+    neurocache_config = _model.base_cache.config
+    bottom_layer_idx = min(neurocache_config.attention_layers + neurocache_config.cache_layers)
+
+    if hasattr(_model, "base_model"):
+        _model = _model.model
+    if hasattr(_model, "model"):
+        _model = _model.model
+    if hasattr(_model, "decoder"):
+        _model = _model.decoder
+    layers = get_attribute(_model, "layers")
+
+    def forward_hook(module, args, output):
+        return tuple(a.detach() if isinstance(a, torch.Tensor) else a for a in output)
+
+    bottom_layer = layers[bottom_layer_idx - 1]
+    bottom_layer.register_forward_hook(forward_hook)
+
+
 def initialize_model(args, accelerator):
+    if args.nf4:
+        compute_dtype = getattr(torch, args.cache_dtype)
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype,
+            device_map="auto",
+        )
+    else:
+        quant_config = None
+
     config = AutoConfig.from_pretrained(
         args.model_name_or_path,
     )
+    config.use_cache = False
+    config._flash_attn_2_enabled = True
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         config=config,
-        low_cpu_mem_usage=args.low_cpu_mem_usage,
+        quantization_config=quant_config,
+        torch_dtype=getattr(torch, args.cache_dtype) if not args.nf4 else None,
     )
+
+    # Prepare the model for kbit training.
+    if args.nf4:
+        model = prepare_model_for_kbit_training(model)
 
     # Set up the neurocache config and wrap the model with the neurocache model.
     if args.cache_layers is not None:
@@ -63,11 +148,11 @@ def initialize_model(args, accelerator):
 
     if not args.disable_lora:
         # Apply LoRA to the main model to adapt it to using neurocache.
-        lora_layers = attention_layers if args.lora_upper_layers else None
+        lora_layers = attention_layers
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            target_modules=["fc1", "fc2"],
+            target_modules=args.lora_modules.split(","),
             lora_dropout=args.lora_dropout,
             layers_to_transform=lora_layers,
             bias="none",
@@ -77,18 +162,34 @@ def initialize_model(args, accelerator):
         model = inject_adapter_in_model(lora_config, model, "neurocache")
 
     if not args.disable_neurocache:
-        neurocache_config = OnDeviceCacheConfig(
-            attention_layers=attention_layers,
-            cache_layers=cache_layers,
-            cache_size=args.cache_size,
-            cache_dtype=args.cache_dtype,
-            compression_factor=args.compression_factor,
-            neighborhood_size=args.neighborhood_size,
-            context_size=args.context_size,
-            topk=args.topk,
-        )
-        model = NeurocacheModelForCausalLM(model, neurocache_config)
-        logger.info(f"Neurocache Config: {neurocache_config}")
+        if not args.pretrained_neurocache:
+            neurocache_config = OnDeviceCacheConfig(
+                attention_layers=attention_layers,
+                cache_layers=cache_layers,
+                cache_size=args.cache_size,
+                cache_dtype=args.cache_dtype,
+                compression_factor=args.compression_factor,
+                neighborhood_size=args.neighborhood_size,
+                context_size=args.context_size,
+                topk=args.topk,
+            )
+            model = NeurocacheModelForCausalLM(model, neurocache_config)
+            logger.info(f"Neurocache Config: {neurocache_config}")
+            logger.info("Initializing neurocache weights from pretrained model.")
+            init_neurocache_weights_(args, model.base_cache)
+        else:
+            logger.info(f"Loading neurocache from {args.pretrained_neurocache}")
+            model = NeurocacheModelForCausalLM.from_pretrained(
+                model, args.pretrained_neurocache, cache_type="ONDEVICE", is_training=True
+            )
+        model = model.to(accelerator.device)
+
+    if args.disable_grad_checkpointing:
+        model.base_model.gradient_checkpointing_disable()
+    else:
+        model.base_model.gradient_checkpointing_enable()
+        model.base_model.enable_input_require_grads()
+        prevent_full_backward_pass(model)
 
     print_trainable_parameters(model, accelerator)
     return model
@@ -120,9 +221,9 @@ def print_trainable_parameters(model, accelerator):
     )
 
 
-def initialize_dataloader(args, task_config, split, accelerator, resume_step=0):
-    distributed_batch_size = args.per_device_batch_size * accelerator.num_processes
-    per_device_batch_size = args.per_device_batch_size
+def initialize_dataloader(batch_size, task_config, split, accelerator, resume_step=0):
+    distributed_batch_size = batch_size * accelerator.num_processes
+    per_device_batch_size = batch_size
 
     dataset = dutils.LongTextDataset(task_config, split, distributed_batch_size, skip=resume_step)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, pin_memory=True)
@@ -150,6 +251,12 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
     logger.info(f"    Steps: {global_step}")
     logger.info(f"    Prefix: {prefix}")
 
+    if not args.disable_neurocache:
+        if isinstance(model, NeurocacheModelForCausalLM):
+            model.base_cache.reinitialize_cache()
+        elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model.module.base_cache.reinitialize_cache()
+
     model.eval()
     losses = []
     progress_bar = tqdm(
@@ -162,7 +269,7 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
             target_ids = batch.pop("labels")
             epoch = batch.pop("epochs")[0].item()
 
-            if not isinstance(model, NeurocacheModelForCausalLM):
+            if args.disable_neurocache:
                 batch.pop("start_of_sequence")
 
             outputs = model(**batch)
@@ -172,7 +279,7 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
                 ignore_index=0,  # TODO: get this id from tokenizer
             )
 
-        losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_batch_size)))
+        losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
         if step >= args.max_eval_steps and args.max_eval_steps > 0:
             break
 
@@ -199,11 +306,18 @@ def run_evaluation(args, model, dataloader, accelerator, global_step=0, prefix="
         )
 
     model.train()
+    if not args.disable_neurocache:
+        if isinstance(model, NeurocacheModelForCausalLM):
+            model.base_cache.reinitialize_cache()
+        elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model.module.base_cache.reinitialize_cache()
     return eval_loss, bits_per_token, perplexity
 
 
 def main():
     args = parse_args()
+
+    print(args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -258,12 +372,18 @@ def main():
     optimizer_grouped_parameters = [
         {
             "params": [
-                p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)
+                p
+                for n, p in model.named_parameters()
+                if (not any(nd in n for nd in no_decay) and p.requires_grad)
             ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if (any(nd in n for nd in no_decay) and p.requires_grad)
+            ],
             "weight_decay": 0.0,
         },
     ]
@@ -273,13 +393,14 @@ def main():
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.num_warmup_steps,
+        num_training_steps=args.max_train_steps,
     )
 
     # Initialize the datasets
-    eval_dataloader = initialize_dataloader(args, task_config, task_config.eval_split, accelerator)
-    test_dataloader = initialize_dataloader(args, task_config, task_config.test_split, accelerator)
+    eval_dataloader = initialize_dataloader(
+        args.per_device_eval_batch_size, task_config, task_config.eval_split, accelerator
+    )
 
     # Prepare everything with our `accelerator`.
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
@@ -293,11 +414,13 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     total_batch_size = (
-        args.per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        args.per_device_train_batch_size
+        * accelerator.num_processes
+        * args.gradient_accumulation_steps
     )
 
     logger.info("***** Running training *****")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_batch_size}")
+    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
     )
@@ -324,7 +447,11 @@ def main():
     # update the progress_bar if load from checkpoint
     if not args.only_evaluate:
         train_dataloader = initialize_dataloader(
-            args, task_config, task_config.train_split, accelerator, resume_step=resume_step
+            args.per_device_train_batch_size,
+            task_config,
+            task_config.train_split,
+            accelerator,
+            resume_step=resume_step,
         )
 
         progress_bar.update(completed_steps)
@@ -336,7 +463,7 @@ def main():
                 target_ids = batch.pop("labels")
                 epoch = batch.pop("epochs")[0].item()
 
-                if not isinstance(model, NeurocacheModelForCausalLM):
+                if args.disable_neurocache:
                     batch.pop("start_of_sequence")
 
                 # Forward pass
@@ -349,6 +476,11 @@ def main():
 
                 # Backward pass
                 accelerator.backward(loss)
+
+                # Clip gradients
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -394,7 +526,7 @@ def main():
                         eval_dataloader,
                         accelerator,
                         global_step=completed_steps,
-                        prefix="eval",
+                        prefix="validation",
                     )
 
                 # Save model checkpoint
@@ -415,23 +547,39 @@ def main():
                         )
                         for ckpt in checkpoint_paths[: -args.keep_n_checkpoints]:
                             logger.info(f"Removing old checkpoint: {ckpt}")
-                            shutil.rmtree(ckpt)
+                            # remove checkpoint
+                            shutil.rmtree(ckpt, ignore_errors=True)
 
                 if completed_steps >= args.max_train_steps:
                     break
 
-    # Final evaluation
+        if args.with_tracking:
+            accelerator.end_training()
+
+        # Save the model
+        if args.output_dir is not None:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            if accelerator.is_main_process:
+                if isinstance(unwrapped_model, NeurocacheModelForCausalLM):
+                    unwrapped_model.save_pretrained(args.output_dir)
+                elif not args.disable_lora:
+                    from peft import get_peft_model_state_dict
+
+                    state_dict = get_peft_model_state_dict(model, adapter_name="neurocache")
+                    torch.save(state_dict, os.path.join(args.output_dir, "pytorch_model.bin"))
+                else:
+                    state_dict = unwrapped_model.state_dict()
+                    torch.save(state_dict, os.path.join(args.output_dir, "pytorch_model.bin"))
+    else:
+        run_evaluation(
+            args, model, eval_dataloader, accelerator, completed_steps, prefix="validation"
+        )
+
+    test_dataloader = initialize_dataloader(
+        args.per_device_eval_batch_size, task_config, task_config.test_split, accelerator
+    )
     run_evaluation(args, model, test_dataloader, accelerator, completed_steps, prefix="test")
-
-    if args.with_tracking:
-        accelerator.end_training()
-
-    # Save the model
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        if accelerator.is_main_process:
-            unwrapped_model.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":

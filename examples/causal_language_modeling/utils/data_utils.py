@@ -81,3 +81,4 @@ def setup_tasks(tokenizer_path: str):
     """Setup the pretraining tasks."""
     define_pretraining_task("long_pile", "1.0.0", HFVocabulary(tokenizer_path))
     define_pretraining_task("long_pile", "1.1.0", HFVocabulary(tokenizer_path))
+    define_pretraining_task("long_long_pile", "1.0.0", HFVocabulary(tokenizer_path))

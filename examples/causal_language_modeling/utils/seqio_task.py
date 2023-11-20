@@ -55,3 +55,19 @@ def define_pretraining_task(tfds_name: str, tfds_version: str, vocab: seqio.Voca
             "targets": seqio.Feature(vocab, add_eos=True, dtype=tf.int32),
         },
     )
+
+
+def define_pg19(vocab: seqio.Vocabulary):
+    seqio.TaskRegistry.add(
+        "pg19:0.1.1",
+        seqio.TfdsDataSource(tfds_name="pg19:0.1.1"),
+        preprocessors=[
+            functools.partial(rekey_articles, rekey={"book_text": "targets"}, keep={"book_title"}),
+            seqio.preprocessors.tokenize,
+            seqio.preprocessors.append_eos,
+            bos.prepend_bos,
+        ],
+        output_features={
+            "targets": seqio.Feature(vocab, add_eos=True, dtype=tf.int32),
+        },
+    )

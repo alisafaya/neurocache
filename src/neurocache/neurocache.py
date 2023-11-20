@@ -19,7 +19,15 @@ def get_attribute(object, attr_name):
     for option in COMMON_MODULE_NAMES[attr_name]:
         if hasattr(object, option):
             return getattr(object, option)
-    raise ValueError("Cannot infer attribute. Options: {}".format(attr_name))
+    raise AttributeError("Cannot infer attribute. Options: {}".format(attr_name))
+
+
+def repeat_kv(kv, n_groups):
+    bsz, seq_len, num_kv_heads, n_neighbors, head_dim = kv.shape
+    if n_groups == 1:
+        return kv
+    kv = kv[..., None, :, :].expand(bsz, seq_len, num_kv_heads, n_groups, n_neighbors, head_dim)
+    return kv.reshape(bsz, seq_len, -1, n_neighbors, head_dim)
 
 
 class CacheAttention(nn.Module):
@@ -48,22 +56,25 @@ class CacheAttention(nn.Module):
         super().__init__()
         self.config = config
 
-        self.hidden_size = get_attribute(base_config, "hidden_size")
+        try:
+            # check if the model supports grouped query attention
+            self.num_kv_heads = get_attribute(base_config, "num_kv_heads")
+        except AttributeError:
+            self.num_kv_heads = get_attribute(base_config, "num_heads")
+
         self.num_heads = get_attribute(base_config, "num_heads")
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.hidden_size = get_attribute(base_config, "hidden_size")
 
         self.head_dim = self.hidden_size // self.num_heads
         self.scaler = self.head_dim**-0.5
         self.r_hidden_size = self.hidden_size // self.config.compression_factor
 
-        # TODO: add support for GQA (for big llamas and mistral)
-        # TODO: add bias option based on the model config
-        self.k_proj = nn.Linear(self.r_hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.r_hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.r_hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.r_hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-        self._init_proj_weights(get_attribute(base_decoder_layer, "self_attn"))
-        # self.apply(self._weight_init)
+        self.apply(self._weight_init)
 
     @torch.no_grad()
     def _weight_init(self, module):
@@ -137,7 +148,7 @@ class CacheAttention(nn.Module):
             hidden_states: output of the previous layer.
                 [batch_size, seq_len, hidden_size]
             ext_hidden_states: hidden states retrieved from cache.
-                [batch_size, seq_len, num_neighbor, hidden_size]
+                [batch_size, seq_len, num_neighbors, hidden_size]
         """
         assert ext_hidden_states.shape[-1] == self.r_hidden_size
         assert hidden_states.shape[-1] == self.hidden_size
@@ -150,9 +161,9 @@ class CacheAttention(nn.Module):
 
         # Project external states into keys and values.
         keys = self.k_proj(ext_hidden_states)
-        keys = keys.view(batch_size, seq_len, self.num_heads, num_neighbors, self.head_dim)
+        keys = keys.view(batch_size, seq_len, self.num_kv_heads, num_neighbors, self.head_dim)
         values = self.v_proj(ext_hidden_states)
-        values = values.view(batch_size, seq_len, self.num_heads, num_neighbors, self.head_dim)
+        values = values.view(batch_size, seq_len, self.num_kv_heads, num_neighbors, self.head_dim)
 
         def repeat_neighbors(neighbors: Array, ctx_size: int):
             assert neighbors.ndim == 5
@@ -173,6 +184,9 @@ class CacheAttention(nn.Module):
         if self.config.context_size > 1:
             keys = repeat_neighbors(keys, self.config.context_size)
             values = repeat_neighbors(values, self.config.context_size)
+
+        keys = repeat_kv(keys, self.num_key_value_groups)
+        values = repeat_kv(values, self.num_key_value_groups)
 
         # Compute attention over keys and values.
         attn_output = self.ext_attention(keys, values, queries)
@@ -218,13 +232,9 @@ class Neurocache(nn.Module):
             self.h_norm = nn.Identity()
             self.cache_dim = self.hidden_size
 
-        if config.cache_dtype == "bfloat16":
-            self.cache_dtype = torch.bfloat16
-        elif config.cache_dtype == "float16":
-            self.cache_dtype = torch.float16
-        elif config.cache_dtype == "float32":
-            self.cache_dtype = torch.float32
-        else:
+        try:
+            self.cache_dtype = getattr(torch, config.cache_dtype)
+        except AttributeError:
             raise ValueError("Invalid cache dtype: {}".format(config.cache_dtype))
 
         self.retrieval_state = {}
@@ -351,7 +361,7 @@ class Neurocache(nn.Module):
         # stored in the cache
         # This is always done without gradients, even during training
         # since we do not backpropagate through the cache.
-        phs = self.h_norm(self.h_proj(hs)).to(self.cache_dtype).detach()
+        phs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
 
         # 1. Retrieve topk neighbors from cache
 

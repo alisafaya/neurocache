@@ -41,6 +41,7 @@ NEUROCACHE_SUPPORTED_MODELS = [
 COMMON_MODULE_NAMES = {
     "num_layers": ["num_hidden_layers", "num_layers", "n_layers"],
     "num_heads": ["num_attention_heads", "num_heads", "n_heads"],
+    "num_kv_heads": ["num_key_value_heads"],
     "hidden_size": ["hidden_size", "d_model", "embed_dim"],
     "self_attn": ["self_attention", "self_attn", "attn", "dec_attn"],
     "o_proj": ["o_proj", "out_proj", "output_proj", "output_projection"],
