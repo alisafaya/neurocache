@@ -1,10 +1,12 @@
 from dataclasses import dataclass
+from typing import Iterator
 
 import torch
+from seqio import SentencePieceVocabulary
 from torch.utils.data import IterableDataset
 
 from utils.hf_tokenizer_wrapper import HFVocabulary
-from utils.seqio_task import define_pretraining_task
+from utils.seqio_task import define_pg19, define_pretraining_task
 from utils.text_dataset import load_text_dataset
 
 
@@ -77,8 +79,29 @@ class LongTextDataset(IterableDataset):
             return next(self)
 
 
+class PlaceholderDataset(IterableDataset):
+    def __init__(self, task_config, split, total_bsz, skip=0, **kwargs):
+        self.skip = skip
+        self.total_bsz = total_bsz
+        self.seq_len = task_config.sequence_length
+
+    def __iter__(self) -> Iterator:
+        return self
+
+    def __next__(self):
+        return {
+            "input_ids": torch.LongTensor(self.total_bsz, self.seq_len).fill_(1),
+            "attention_mask": torch.LongTensor(self.total_bsz, self.seq_len).fill_(1),
+            "labels": torch.LongTensor(self.total_bsz, self.seq_len).fill_(1),
+            "start_of_sequence": torch.BoolTensor(self.total_bsz).fill_(False),
+            "epochs": torch.LongTensor(self.total_bsz).fill_(0),
+        }
+
+
 def setup_tasks(tokenizer_path: str):
     """Setup the pretraining tasks."""
-    define_pretraining_task("long_pile", "1.0.0", HFVocabulary(tokenizer_path))
-    define_pretraining_task("long_pile", "1.1.0", HFVocabulary(tokenizer_path))
-    define_pretraining_task("long_long_pile", "1.0.0", HFVocabulary(tokenizer_path))
+    vocab_cls = SentencePieceVocabulary if tokenizer_path.endswith(".model") else HFVocabulary
+    define_pg19(vocab_cls(tokenizer_path))
+    define_pretraining_task("long_pile", "1.0.0", vocab_cls(tokenizer_path))
+    define_pretraining_task("long_pile", "1.1.0", vocab_cls(tokenizer_path))
+    define_pretraining_task("long_long_pile", "1.0.0", vocab_cls(tokenizer_path))

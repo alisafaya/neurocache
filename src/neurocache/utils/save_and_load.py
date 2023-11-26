@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
-from peft import get_peft_model_state_dict
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file as safe_load_file
 
 from .types import NeurocacheType
@@ -59,10 +59,10 @@ def set_neurocache_model_state_dict(model, neurocache_model_state_dict):
     config = model.neurocache_config
 
     if config.neurocache_type == NeurocacheType.ONDEVICE:
-        load_adapters = model.base_model.load_state_dict(neurocache_model_state_dict, strict=False)
         load_result = model.base_cache.load_state_dict(neurocache_model_state_dict, strict=False)
-        load_result.missing_keys.extend(load_adapters.missing_keys)
-        load_result.unexpected_keys.extend(load_adapters.unexpected_keys)
+        set_peft_model_state_dict(
+            model.base_model, neurocache_model_state_dict, adapter_name="neurocache"
+        )
     else:
         raise NotImplementedError
 

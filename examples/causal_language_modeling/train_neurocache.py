@@ -160,6 +160,10 @@ def initialize_model(args, accelerator):
         )
         logger.info(f"LoRA Config: {lora_config}")
         model = inject_adapter_in_model(lora_config, model, "neurocache")
+    else:
+        # freeze the model
+        for param in model.parameters():
+            param.requires_grad = False
 
     if not args.disable_neurocache:
         if not args.pretrained_neurocache:
@@ -172,6 +176,7 @@ def initialize_model(args, accelerator):
                 neighborhood_size=args.neighborhood_size,
                 context_size=args.context_size,
                 topk=args.topk,
+                cache_type=args.cache_type,
             )
             model = NeurocacheModelForCausalLM(model, neurocache_config)
             logger.info(f"Neurocache Config: {neurocache_config}")
@@ -225,7 +230,15 @@ def initialize_dataloader(batch_size, task_config, split, accelerator, resume_st
     distributed_batch_size = batch_size * accelerator.num_processes
     per_device_batch_size = batch_size
 
-    dataset = dutils.LongTextDataset(task_config, split, distributed_batch_size, skip=resume_step)
+    if accelerator.is_local_main_process:
+        dataset = dutils.LongTextDataset(
+            task_config, split, distributed_batch_size, skip=resume_step
+        )
+    else:
+        dataset = dutils.PlaceholderDataset(
+            task_config, split, distributed_batch_size, skip=resume_step
+        )
+
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, pin_memory=True)
 
     def slice_fn(data, tensor_slice, process_index=None, num_processes=None):
@@ -361,7 +374,10 @@ def main():
     task_config = dutils.TrainingTaskConfig.from_args(args)
 
     # Set up seqio tasks
-    dutils.setup_tasks(args.model_name_or_path)
+    if args.tokenizer_name is not None:
+        dutils.setup_tasks(args.tokenizer_name)
+    else:
+        dutils.setup_tasks(args.model_name_or_path)
 
     # Initialize the model
     model = initialize_model(args, accelerator)

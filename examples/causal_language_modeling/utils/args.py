@@ -9,6 +9,7 @@ def parse_args():
     # Task arguments
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--dataset_name", type=str, required=True)
+    parser.add_argument("--tokenizer_name", type=str)
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--eval_split", type=str, default="validation")
     parser.add_argument("--test_split", type=str, default="test")
@@ -60,6 +61,7 @@ def parse_args():
     parser.add_argument("--attention_layers", type=str, default=None)
     parser.add_argument("--cache_layers", type=str, default=None)
     parser.add_argument("--cache_size", type=int, default=16384)
+    parser.add_argument("--cache_type", type=str, default="FIFO", choices=["FIFO", "LRU"])
     parser.add_argument(
         "--cache_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"]
     )

@@ -187,24 +187,55 @@ class OnDeviceCache(Cache):
         else:
             self.value_db = None
 
+        if ordering == "LRU":
+            # Initialize last used time for each cache item
+            self.register_buffer(
+                "last_used",
+                torch.full((self.num_caches, self.cache_size), -1, dtype=torch.int32),
+                persistent=False,
+            )
+
     def update_kv_cache_(self, cache, new_values, start_index):
         num_caches, cache_size, _ = cache.shape
+        _, num_kv, _ = new_values.shape
         assert cache_size == self.cache_size, f"{cache_size} vs {self.cache_size}"
         assert num_caches == self.num_caches
         assert new_values.ndim == 3
         assert start_index.shape == (self.num_caches,)
 
-        if self.ordering == "FIFO":
+        if self.ordering == "FIFO" or self.cache_size >= (self.db_index.max() + num_kv):
             # FIFO: overwrite oldest entries first
             update_indices = (
                 torch.arange(new_values.shape[1], device=start_index.device) + start_index[:, None]
             )  # (num_caches, num_kv)
             update_indices = update_indices % cache_size
             cache.scatter_(1, update_indices[..., None].expand_as(new_values), new_values)
+
+            if self.ordering == "LRU":
+                # Update last used time for each updated cache item
+                self.last_used.scatter_(
+                    1, update_indices, (self.db_index[:, None] + num_kv).expand_as(update_indices)
+                )
+
         elif self.ordering == "LRU":
-            # LRU: overwrite least recently used entries first
-            # TODO: implement LRU
-            raise NotImplementedError
+            # LRU: overwrite least recently used entries, if cache is full
+            for cache_index in range(self.num_caches):
+                # Find the least recently used entries
+                lru_indices = torch.argsort(self.last_used[cache_index])[num_kv:]
+                lru_indices = torch.sort(lru_indices).values
+
+                # Update cache
+                cache[cache_index] = torch.cat(
+                    [cache[cache_index, lru_indices], new_values[cache_index]]
+                )
+
+                # Update last used time
+                self.last_used[cache_index] = torch.cat(
+                    [
+                        self.last_used[cache_index, lru_indices],
+                        self.db_index[cache_index, None].expand(num_kv),
+                    ]
+                )
         else:
             raise ValueError(f"Unknown ordering: {self.ordering}")
 
@@ -235,6 +266,7 @@ class OnDeviceCache(Cache):
             value = torch.moveaxis(value, source=1, destination=0)  # split by cache
             self.update_kv_cache_(self.value_db, value, self.db_index)
 
+        # Update db_index
         self.db_index = self.db_index + num_kv
         return 0
 
@@ -252,6 +284,10 @@ class OnDeviceCache(Cache):
         # Reset value_db for the specified caches (if it exists)
         if self.value_db is not None:
             self.value_db[caches] = 0.0
+
+        if self.ordering == "LRU":
+            # Reset last used time for the specified caches
+            self.last_used[caches] = -1
         return 0
 
     def topk_retrieval(self, query: Array, mask: Array, num_neighbors: int) -> Tuple[Array, Array]:
@@ -272,7 +308,7 @@ class OnDeviceCache(Cache):
         query = torch.movedim(query, source=1, destination=0)
 
         # Process batches sequentially
-        selected_keys, selected_values, _, _ = zip(
+        selected_keys, selected_values, topk_scores, topk_indices = zip(
             *(
                 retrieve_topk_gatherless(
                     query[i],
@@ -297,5 +333,11 @@ class OnDeviceCache(Cache):
         else:
             assert self.value_db is None
             selected_values = None
+
+        # Update last used time for each accessed cache item
+        # Assuming topk_indices is the indices of accessed items in cache
+        if self.ordering == "LRU":
+            for i in range(len(topk_indices)):
+                self.last_used[i, topk_indices[i].flatten()] = self.db_index[i]
 
         return selected_keys, selected_values
