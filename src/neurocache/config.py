@@ -126,7 +126,7 @@ class NeurocacheConfigMixin(PushToHubMixin):
                 )
 
         loaded_attributes = cls.from_json_file(config_file)
-        kwargs = {**class_kwargs, **loaded_attributes}
+        kwargs = {**loaded_attributes, **class_kwargs}
         config = cls(**kwargs)
         return config
 
@@ -153,7 +153,7 @@ class NeurocacheConfigMixin(PushToHubMixin):
         for key, value in kwargs.items():
             if key in inspect.signature(hf_hub_download).parameters:
                 hf_hub_download_kwargs[key] = value
-            elif key in list(cls.__annotations__):
+            elif key in list(cls.__annotations__) + list(cls.__dataclass_fields__):
                 class_kwargs[key] = value
             else:
                 other_kwargs[key] = value

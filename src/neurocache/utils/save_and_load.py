@@ -46,7 +46,9 @@ def get_neurocache_model_state_dict(model, unwrap_compiled=False):
     # Get the state dict of the adapters
     try:
         if hasattr(model.base_model, "peft_config"):
-            state_dict.update(get_peft_model_state_dict(model.base_model, adapter_name="neurocache"))
+            state_dict.update(
+                get_peft_model_state_dict(model.base_model, adapter_name="neurocache")
+            )
     except KeyError:
         pass
     return state_dict

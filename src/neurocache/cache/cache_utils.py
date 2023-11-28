@@ -185,6 +185,7 @@ class BatchedCache(nn.Module):
             value = _rearrange_dimensions(value, self.split_dimensions)
 
         if mask is not None:
+            mask = mask.unsqueeze(-1).repeat(1, 1, key.shape[2])
             mask = _rearrange_dimensions(mask, self.split_dimensions)
 
         return self.wrapped.update(key, value, mask)

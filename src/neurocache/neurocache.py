@@ -136,7 +136,7 @@ class CacheAttention(nn.Module):
         attn_output = torch.einsum("...hqi,...qhid->...qhd", ext_attn, external_values)
         return attn_output
 
-    def forward(self, hidden_states, ext_hidden_states, cached_key_values = None, use_cache = False):
+    def forward(self, hidden_states, ext_hidden_states, cached_key_values=None):
         """Attention over retrieved cached states.
             1. Project hidden states into queries.
             2. Project cached states into keys and values.
@@ -190,7 +190,10 @@ class CacheAttention(nn.Module):
                 keys = torch.cat([cached_key_values[2], keys], dim=1)
                 values = torch.cat([cached_key_values[3], values], dim=1)
 
-            cached_key_values = (keys[:, -self.config.context_size + 1 :], values[:, -self.config.context_size + 1 :])
+            cached_key_values = (
+                keys[:, -self.config.context_size + 1 :],
+                values[:, -self.config.context_size + 1 :],
+            )
             keys = repeat_neighbors(keys, self.config.context_size)
             values = repeat_neighbors(values, self.config.context_size)
 
@@ -257,6 +260,7 @@ class Neurocache(nn.Module):
         self.caches = nn.ModuleList([])
         self.hooks = self._register_hooks(base_model)
         self.enabled = True
+        self.update_cache = True
 
     def enable(self):
         """Enable cache."""
@@ -281,6 +285,14 @@ class Neurocache(nn.Module):
             and self.config.neurocache_type == NeurocacheType.ONDEVICE
             and self.config.compression_factor > 1
         )
+
+    def disable_update(self):
+        """Disable cache update."""
+        self.update_cache = False
+
+    def enable_update(self):
+        """Enable cache update."""
+        self.update_cache = True
 
     def reinitialize_cache(self):
         """Reinitialize cache.
@@ -353,15 +365,16 @@ class Neurocache(nn.Module):
         if not self.enabled:
             return
 
-        # Residual connection with previous self attention
         cache_attn_output, cached_key_values = self.cache_attns[idx](
             kwargs["hidden_states"],
-            self.retrieval_state["ext_hidden_states"], 
-            cached_key_values=kwargs["past_key_value"]
+            self.retrieval_state["ext_hidden_states"],
+            cached_key_values=kwargs["past_key_value"],
         )
+
+        # Residual connection with self attention output
         residual = outputs[0] + cache_attn_output
-        past_key_value = (outputs[-1] + cached_key_values,) if outputs[-1] is not None else None
-        outputs = (residual,) + outputs[1:-1] + past_key_value
+        past_key_value = outputs[-1] + cached_key_values if outputs[-1] is not None else None
+        outputs = (residual,) + outputs[1:-1] + (past_key_value,)
         return outputs
 
     def retrieve_hook(self, module, args, kwargs, outputs, idx):
@@ -372,8 +385,11 @@ class Neurocache(nn.Module):
         hs = kwargs["hidden_states"].detach()
         batch_size, seq_len, hidden_size = hs.shape
 
-        # TODO: Infer padding mask from attention mask
-        input_mask = None
+        # Infer padding mask from attention mask
+        input_mask = kwargs["attention_mask"].detach().to(torch.bool)
+        input_mask = input_mask.all(axis=2).squeeze().logical_not()
+        if self.update_cache:
+            hs *= input_mask.unsqueeze(-1)
 
         # Project hidden states to lower dimension and normalize these
         # will be used as queries for the cache and as values to be
@@ -381,6 +397,8 @@ class Neurocache(nn.Module):
         # This is always done without gradients, even during training
         # since we do not backpropagate through the cache.
         phs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
+        if self.update_cache:
+            phs *= input_mask.unsqueeze(-1)
 
         # 1. Retrieve topk neighbors from cache
 
@@ -436,11 +454,11 @@ class Neurocache(nn.Module):
         self.retrieval_state["ext_hidden_states"] = ext_hs
 
         # 2. Update cache with new hidden states
-
-        # If training keep both projected and original hidden states
-        # to train the h_proj and h_norm layers, otherwise keep only
-        # projected hidden states
-        if self.should_reencode():
-            self.caches[idx].update(phs, hs.to(self.cache_dtype), input_mask)
-        else:
-            self.caches[idx].update(phs, None, input_mask)
+        if self.update_cache:
+            # If training keep both projected and original hidden states
+            # to train the h_proj and h_norm layers, otherwise keep only
+            # projected hidden states
+            if self.should_reencode():
+                self.caches[idx].update(phs, hs.to(self.cache_dtype), input_mask)
+            else:
+                self.caches[idx].update(phs, None, input_mask)

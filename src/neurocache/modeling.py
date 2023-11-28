@@ -350,6 +350,17 @@ class NeurocacheModelForCausalLM(NeurocacheModel):
             self.base_model.prepare_inputs_for_generation
         )
 
+    @contextmanager
+    def generation_mode(self):
+        """
+        Enables the generation pass.
+        """
+        try:
+            self.base_cache.disable_update()
+            yield
+        finally:
+            self.base_cache.enable_update()
+
     def forward(
         self,
         input_ids=None,
