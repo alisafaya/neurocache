@@ -203,7 +203,7 @@ class OnDeviceCache(Cache):
         assert new_values.ndim == 3
         assert start_index.shape == (self.num_caches,)
 
-        if self.ordering == "FIFO" or self.cache_size >= (self.db_index.max() + num_kv):
+        if self.ordering == "FIFO":
             # FIFO: overwrite oldest entries first
             update_indices = (
                 torch.arange(new_values.shape[1], device=start_index.device) + start_index[:, None]
@@ -211,31 +211,38 @@ class OnDeviceCache(Cache):
             update_indices = update_indices % cache_size
             cache.scatter_(1, update_indices[..., None].expand_as(new_values), new_values)
 
-            if self.ordering == "LRU":
-                # Update last used time for each updated cache item
-                self.last_used.scatter_(
-                    1, update_indices, (self.db_index[:, None] + num_kv).expand_as(update_indices)
-                )
-
         elif self.ordering == "LRU":
             # LRU: overwrite least recently used entries, if cache is full
             for cache_index in range(self.num_caches):
-                # Find the least recently used entries
-                lru_indices = torch.argsort(self.last_used[cache_index])[num_kv:]
-                lru_indices = torch.sort(lru_indices).values
+                if self.cache_size >= self.db_index[cache_index] + num_kv:
+                    # Update cache as FIFO
+                    update_indices = (
+                        torch.arange(new_values.shape[1], device=start_index.device)
+                        + start_index[cache_index]
+                    ) % cache_size
+                    cache[cache_index][update_indices] = new_values[cache_index]
 
-                # Update cache
-                cache[cache_index] = torch.cat(
-                    [cache[cache_index, lru_indices], new_values[cache_index]]
-                )
+                    # Update last used time for each updated cache item
+                    self.last_used[cache_index, update_indices] = (
+                        self.db_index[cache_index, None] + num_kv
+                    ).expand_as(update_indices)
+                else:
+                    # Find the least recently used entries
+                    lru_indices = torch.argsort(self.last_used[cache_index])[num_kv:]
+                    lru_indices = torch.sort(lru_indices).values
 
-                # Update last used time
-                self.last_used[cache_index] = torch.cat(
-                    [
-                        self.last_used[cache_index, lru_indices],
-                        self.db_index[cache_index, None].expand(num_kv),
-                    ]
-                )
+                    # Update cache
+                    cache[cache_index] = torch.cat(
+                        [cache[cache_index, lru_indices], new_values[cache_index]]
+                    )
+
+                    # Update last used time
+                    self.last_used[cache_index] = torch.cat(
+                        [
+                            self.last_used[cache_index, lru_indices],
+                            self.db_index[cache_index, None].expand(num_kv) + num_kv,
+                        ]
+                    )
         else:
             raise ValueError(f"Unknown ordering: {self.ordering}")
 

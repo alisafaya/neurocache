@@ -460,6 +460,9 @@ def main():
         )
         completed_steps = resume_step // args.gradient_accumulation_steps
 
+    if args.save_and_quit:
+        unwrapped_model.save_pretrained(args.output_dir)
+
     # update the progress_bar if load from checkpoint
     if not args.only_evaluate:
         train_dataloader = initialize_dataloader(

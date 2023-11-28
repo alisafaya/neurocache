@@ -136,7 +136,7 @@ class CacheAttention(nn.Module):
         attn_output = torch.einsum("...hqi,...qhid->...qhd", ext_attn, external_values)
         return attn_output
 
-    def forward(self, hidden_states, ext_hidden_states):
+    def forward(self, hidden_states, ext_hidden_states, cached_key_values = None, use_cache = False):
         """Attention over retrieved cached states.
             1. Project hidden states into queries.
             2. Project cached states into keys and values.
@@ -149,6 +149,9 @@ class CacheAttention(nn.Module):
                 [batch_size, seq_len, hidden_size]
             ext_hidden_states: hidden states retrieved from cache.
                 [batch_size, seq_len, num_neighbors, hidden_size]
+            cached_key_values: cached kv from previous passes for generation.
+                [batch_size, context_size - 1, num_kv_heads, num_neighbors, head_dim]
+            use_cache: whether to use key values for generation.
         """
         assert ext_hidden_states.shape[-1] == self.r_hidden_size
         assert hidden_states.shape[-1] == self.hidden_size
@@ -170,20 +173,32 @@ class CacheAttention(nn.Module):
             # Allows access to previous tokens neighbors
             # i-th token will have the neighbors of all tokens from (i - c) to i.
             # We clip so the first tokens do not have negative indices
+            num_kv = neighbors.shape[1]
             context = (
-                torch.arange(seq_len)[:, None] + torch.arange(-ctx_size + 1, 1)[None, :]
-            ).clamp_(0, seq_len - 1)
+                torch.arange(num_kv)[:, None] + torch.arange(-ctx_size + 1, 1)[None, :]
+            ).clamp_(0, num_kv - 1)
 
             neighbors = neighbors.moveaxis(1, 2)
             neighbors = neighbors[:, :, context]
-            neighbors = neighbors.reshape(batch_size, self.num_heads, seq_len, -1, self.head_dim)
+            neighbors = neighbors.reshape(batch_size, self.num_heads, num_kv, -1, self.head_dim)
             neighbors = neighbors.moveaxis(1, 2)
             return neighbors
 
         # Repeat neighbors for each query.
         if self.config.context_size > 1:
+            if cached_key_values is not None:
+                keys = torch.cat([cached_key_values[2], keys], dim=1)
+                values = torch.cat([cached_key_values[3], values], dim=1)
+
+            cached_key_values = (keys[:, -self.config.context_size + 1 :], values[:, -self.config.context_size + 1 :])
             keys = repeat_neighbors(keys, self.config.context_size)
             values = repeat_neighbors(values, self.config.context_size)
+
+            if keys.shape[1] > seq_len:
+                keys = keys[:, -seq_len:]
+                values = values[:, -seq_len:]
+        else:
+            cached_key_values = (None, None)
 
         keys = repeat_kv(keys, self.num_key_value_groups)
         values = repeat_kv(values, self.num_key_value_groups)
@@ -194,7 +209,7 @@ class CacheAttention(nn.Module):
         # Project attention outputs back to hidden states.
         attn_output = attn_output.view(batch_size, seq_len, hidden_size)
         attn_output = self.o_proj(attn_output)
-        return attn_output
+        return attn_output, cached_key_values
 
 
 class Neurocache(nn.Module):
@@ -339,10 +354,14 @@ class Neurocache(nn.Module):
             return
 
         # Residual connection with previous self attention
-        residual = outputs[0] + self.cache_attns[idx](
-            kwargs["hidden_states"], self.retrieval_state["ext_hidden_states"]
+        cache_attn_output, cached_key_values = self.cache_attns[idx](
+            kwargs["hidden_states"],
+            self.retrieval_state["ext_hidden_states"], 
+            cached_key_values=kwargs["past_key_value"]
         )
-        outputs = (residual,) + outputs[1:]
+        residual = outputs[0] + cache_attn_output
+        past_key_value = (outputs[-1] + cached_key_values,) if outputs[-1] is not None else None
+        outputs = (residual,) + outputs[1:-1] + past_key_value
         return outputs
 
     def retrieve_hook(self, module, args, kwargs, outputs, idx):

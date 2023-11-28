@@ -44,7 +44,11 @@ def get_neurocache_model_state_dict(model, unwrap_compiled=False):
     # Get the state dict of neurocache modules
     state_dict = model.base_cache.state_dict()
     # Get the state dict of the adapters
-    state_dict.update(get_peft_model_state_dict(model.base_model, adapter_name="neurocache"))
+    try:
+        if hasattr(model.base_model, "peft_config"):
+            state_dict.update(get_peft_model_state_dict(model.base_model, adapter_name="neurocache"))
+    except KeyError:
+        pass
     return state_dict
 
 
@@ -60,9 +64,13 @@ def set_neurocache_model_state_dict(model, neurocache_model_state_dict):
 
     if config.neurocache_type == NeurocacheType.ONDEVICE:
         load_result = model.base_cache.load_state_dict(neurocache_model_state_dict, strict=False)
-        set_peft_model_state_dict(
-            model.base_model, neurocache_model_state_dict, adapter_name="neurocache"
-        )
+        try:
+            if hasattr(model.base_model, "peft_config"):
+                set_peft_model_state_dict(
+                    model.base_model, neurocache_model_state_dict, adapter_name="neurocache"
+                )
+        except KeyError:
+            pass
     else:
         raise NotImplementedError
 

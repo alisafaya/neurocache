@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--disable_grad_checkpointing", action="store_true")
+
     # This needs to be > 1 for stable training, otherwuse the model will diverge
     # due to distibutional shift between the cache and the model.
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -54,6 +55,7 @@ def parse_args():
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--report_to", type=str, default="tensorboard")
     parser.add_argument("--with_tracking", type=bool, default=True)
+    parser.add_argument("--save_and_quit", action="store_true")
 
     # Neurocache arguments
     parser.add_argument("--pretrained_neurocache", type=str, default=None)
