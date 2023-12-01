@@ -386,19 +386,21 @@ class Neurocache(nn.Module):
         batch_size, seq_len, hidden_size = hs.shape
 
         # Infer padding mask from attention mask
-        input_mask = kwargs["attention_mask"].detach().to(torch.bool)
-        input_mask = input_mask.all(axis=2).squeeze().logical_not()
-        if self.update_cache:
-            hs *= input_mask.unsqueeze(-1)
+        if kwargs.get("attention_mask") is not None:
+            input_mask = kwargs["attention_mask"].detach().to(torch.bool)
+            input_mask = input_mask.all(axis=2).reshape(batch_size, seq_len).logical_not()
+            if self.update_cache:
+                hs *= input_mask.reshape(batch_size, seq_len, 1)
+        else:
+            input_mask = None
 
         # Project hidden states to lower dimension and normalize these
         # will be used as queries for the cache and as values to be
-        # stored in the cache
-        # This is always done without gradients, even during training
-        # since we do not backpropagate through the cache.
+        # stored in the cache. This is always done without gradients,
+        # even during training since we do not backpropagate through the cache.
         phs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
-        if self.update_cache:
-            phs *= input_mask.unsqueeze(-1)
+        if self.update_cache and input_mask is not None:
+            phs *= input_mask.reshape(batch_size, seq_len, 1)
 
         # 1. Retrieve topk neighbors from cache
 
