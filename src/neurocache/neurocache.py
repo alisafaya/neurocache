@@ -136,7 +136,7 @@ class CacheAttention(nn.Module):
         attn_output = torch.einsum("...hqi,...qhid->...qhd", ext_attn, external_values)
         return attn_output
 
-    def forward(self, hidden_states, ext_hidden_states, cached_key_values=None):
+    def forward(self, hidden_states, retrieved_hidden_states, cached_key_values=None):
         """Attention over retrieved cached states.
             1. Project hidden states into queries.
             2. Project cached states into keys and values.
@@ -147,25 +147,25 @@ class CacheAttention(nn.Module):
         Args:
             hidden_states: output of the previous layer.
                 [batch_size, seq_len, hidden_size]
-            ext_hidden_states: hidden states retrieved from cache.
+            retrieved_hidden_states: hidden states retrieved from cache.
                 [batch_size, seq_len, num_neighbors, hidden_size]
             cached_key_values: cached kv from previous passes for generation.
                 [batch_size, context_size - 1, num_kv_heads, num_neighbors, head_dim]
             use_cache: whether to use key values for generation.
         """
-        assert ext_hidden_states.shape[-1] == self.r_hidden_size
+        assert retrieved_hidden_states.shape[-1] == self.r_hidden_size
         assert hidden_states.shape[-1] == self.hidden_size
         batch_size, seq_len, hidden_size = hidden_states.shape
-        _, _, num_neighbors, r_hidden_size = ext_hidden_states.shape
+        _, _, num_neighbors, r_hidden_size = retrieved_hidden_states.shape
 
         # Project hidden states into queries.
         queries = self.q_proj(hidden_states) * self.scaler
         queries = queries.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
         # Project external states into keys and values.
-        keys = self.k_proj(ext_hidden_states)
+        keys = self.k_proj(retrieved_hidden_states)
         keys = keys.view(batch_size, seq_len, self.num_kv_heads, num_neighbors, self.head_dim)
-        values = self.v_proj(ext_hidden_states)
+        values = self.v_proj(retrieved_hidden_states)
         values = values.view(batch_size, seq_len, self.num_kv_heads, num_neighbors, self.head_dim)
 
         def repeat_neighbors(neighbors: Array, ctx_size: int):
@@ -174,13 +174,14 @@ class CacheAttention(nn.Module):
             # i-th token will have the neighbors of all tokens from (i - c) to i.
             # We clip so the first tokens do not have negative indices
             num_kv = neighbors.shape[1]
+            n_heads = neighbors.shape[2]
             context = (
                 torch.arange(num_kv)[:, None] + torch.arange(-ctx_size + 1, 1)[None, :]
             ).clamp_(0, num_kv - 1)
 
             neighbors = neighbors.moveaxis(1, 2)
             neighbors = neighbors[:, :, context]
-            neighbors = neighbors.reshape(batch_size, self.num_heads, num_kv, -1, self.head_dim)
+            neighbors = neighbors.reshape(batch_size, n_heads, num_kv, -1, self.head_dim)
             neighbors = neighbors.moveaxis(1, 2)
             return neighbors
 
@@ -217,11 +218,11 @@ class CacheAttention(nn.Module):
 
 class Neurocache(nn.Module):
     """
-    Wrapper that handles cache retrieval, attention updates.
+    Wrapper that handles cache retrieval, attention, and cache updates.
 
     Args:
+        base_model: model to be wrapped with cache.
         config: Configuration object containing the parameters of model.
-        base_layer: Layer to be wrapped.
     """
 
     def __init__(
@@ -243,7 +244,7 @@ class Neurocache(nn.Module):
             self.cache_dim = self.hidden_size // self.config.compression_factor
             self.h_proj = nn.Linear(self.hidden_size, self.cache_dim, bias=False)
             self.h_proj.apply(_weight_init)
-            self.h_norm = nn.LayerNorm(self.cache_dim, eps=1e-6)
+            self.h_norm = nn.LayerNorm(self.cache_dim)
         else:
             # no-op
             self.h_proj = nn.Identity()
@@ -253,7 +254,11 @@ class Neurocache(nn.Module):
         try:
             self.cache_dtype = getattr(torch, config.cache_dtype)
         except AttributeError:
-            raise ValueError("Invalid cache dtype: {}".format(config.cache_dtype))
+            raise ValueError(
+                """Invalid cache dtype: {}, available options are float16, bfloat16, and float32""".format(
+                    config.cache_dtype
+                )
+            )
 
         self.retrieval_state = {}
         self.cache_attns = nn.ModuleList([])
@@ -313,8 +318,11 @@ class Neurocache(nn.Module):
         if hasattr(base_model, "decoder"):
             base_model = base_model.decoder
 
-        layers = get_attribute(base_model, "layers")
-        num_layers = len(layers)
+        try:
+            layers = get_attribute(base_model, "layers")
+            num_layers = len(layers)
+        except AttributeError:
+            raise AttributeError("Cannot infer decoder layers.")
 
         if self.config.cache_layers is None or len(self.config.cache_layers) == 0:
             cache_idx = num_layers * 3 // 4
@@ -322,6 +330,12 @@ class Neurocache(nn.Module):
             self.config.cache_layers = cache_layers
         else:
             cache_layers = self.config.cache_layers
+
+        if self.config.retrieval_layers is None or len(self.config.retrieval_layers) == 0:
+            # if retrieval layers are not specified, use cache layers
+            retrieval_layers = cache_layers
+        else:
+            retrieval_layers = self.config.retrieval_layers
 
         if self.config.attention_layers is None or len(self.config.attention_layers) == 0:
             attention_layers = list(range(min(cache_layers), num_layers))
@@ -332,25 +346,38 @@ class Neurocache(nn.Module):
         # Check that cache layers are before attention layers
         assert min(attention_layers) >= min(cache_layers)
 
-        # Register hooks and initialize cache attention layers
-        hooks = []
-        for i, idx in enumerate(sorted(cache_layers)):
+        # Initialize caches for storing hidden states
+        for _ in cache_layers:
             split_dims = () if self.config.global_cache else (0,)
             self.caches.append(BatchedCache(None, split_dims))
+
+        # Initialize cache attention layers
+        for idx in sorted(attention_layers):
+            self.cache_attns.append(
+                CacheAttention(layers[idx], self.config, self.base_model_config)
+            )
+
+        # Register cache retrieval hooks
+        hooks = []
+        for i, idx in enumerate(sorted(retrieval_layers)):
             hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
                 functools.partial(self.retrieve_hook, idx=i), prepend=True, with_kwargs=True
             )
             hooks.append(hook)
 
-        for i, idx in enumerate(sorted(attention_layers)):
-            self.cache_attns.append(
-                CacheAttention(layers[idx], self.config, self.base_model_config)
+        # Register cache update hooks
+        for i, idx in enumerate(sorted(cache_layers)):
+            hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
+                functools.partial(self.update_hook, idx=i), with_kwargs=True
             )
+            hooks.append(hook)
+
+        # Register cache attention hooks
+        for i, idx in enumerate(sorted(attention_layers)):
             hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
                 functools.partial(self.attention_hook, idx=i), with_kwargs=True
             )
             hooks.append(hook)
-
         return hooks
 
     def reset_cache(self, start_of_sequence: Array):
@@ -360,14 +387,19 @@ class Neurocache(nn.Module):
                 if cache.wrapped is not None:
                     cache.reset(start_of_sequence)
 
+    @torch.no_grad()
+    def retrieve_topk(self, phs: Array, input_mask: Array, idx: int):
+        """Retrieve topk neighbors from cache."""
+        return self.caches[idx].topk_retrieval(phs, input_mask, self.config.topk)
+
     def attention_hook(self, module, args, kwargs, outputs, idx):
-        """External attention hook."""
+        """Compute attention over retrieved cache, and combine with self attention."""
         if not self.enabled:
             return
 
         cache_attn_output, cached_key_values = self.cache_attns[idx](
             kwargs["hidden_states"],
-            self.retrieval_state["ext_hidden_states"],
+            self.retrieval_state["retrieved_hidden_states"],
             cached_key_values=kwargs["past_key_value"],
         )
 
@@ -378,7 +410,7 @@ class Neurocache(nn.Module):
         return outputs
 
     def retrieve_hook(self, module, args, kwargs, outputs, idx):
-        """Hook to retrieve the hidden states of a layer."""
+        """Retrieve topk neighbors from cache using the hidden states"""
         if not self.enabled:
             return
 
@@ -386,23 +418,18 @@ class Neurocache(nn.Module):
         batch_size, seq_len, hidden_size = hs.shape
 
         # Infer padding mask from attention mask
-        if kwargs.get("attention_mask") is not None:
+        if kwargs.get("attention_mask") is not None and False:
             input_mask = kwargs["attention_mask"].detach().to(torch.bool)
-            input_mask = input_mask.all(axis=2).reshape(batch_size, seq_len).logical_not()
-            if self.update_cache:
-                hs *= input_mask.reshape(batch_size, seq_len, 1)
+            input_mask = input_mask.all(axis=-1).reshape(batch_size, seq_len).logical_not()
         else:
             input_mask = None
 
         # Project hidden states to lower dimension and normalize these
         # will be used as queries for the cache and as values to be
-        # stored in the cache. This is always done without gradients,
-        # even during training since we do not backpropagate through the cache.
-        phs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
-        if self.update_cache and input_mask is not None:
-            phs *= input_mask.reshape(batch_size, seq_len, 1)
-
-        # 1. Retrieve topk neighbors from cache
+        # stored in the cache. We detach since we do not backpropagate
+        # through the cache. No gradients are computed during retrieval.
+        with torch.no_grad():
+            projected_hs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
 
         # Since we need to infer the batch size before initializing
         # the cache we initialize the cache in the first forward pass
@@ -422,16 +449,16 @@ class Neurocache(nn.Module):
                 self.config.similarity_fn,
                 dtype=self.cache_dtype,
                 ordering=self.config.cache_type,
-            ).to(phs.device)
+            ).to(projected_hs.device)
 
-            ext_hs_dim = value_dim if self.should_reencode() else self.cache_dim
-            ext_hs = torch.zeros(
+            retrieved_hs_dim = value_dim if self.should_reencode() else self.cache_dim
+            retrieved_hs = torch.zeros(
                 batch_size,
                 seq_len,
                 self.config.topk * self.config.neighborhood_size,
-                ext_hs_dim,
+                retrieved_hs_dim,
                 dtype=hs.dtype,
-            ).to(phs.device)
+            ).to(projected_hs.device)
 
         # Else if the cache is already initialized retrieve from cache
         else:
@@ -441,26 +468,46 @@ class Neurocache(nn.Module):
                 "Cache batch size does not match hidden states batch size. "
                 "Please re-initalize Neurocache."
             )
-
-            with torch.no_grad():
-                keys, values = self.caches[idx].topk_retrieval(phs, input_mask, self.config.topk)
-                ext_hs = values if self.should_reencode() else keys
-                assert ext_hs is not None, "Retrieved cache is None"
-                ext_hs = ext_hs.to(hs.dtype)
+            keys, values = self.retrieve_topk(projected_hs, input_mask, idx)
+            retrieved_hs = values if self.should_reencode() else keys
+            assert retrieved_hs is not None, "Retrieved cache is None"
+            retrieved_hs = retrieved_hs.to(hs.dtype)
 
         if self.should_reencode():
-            # re-project retrieved values to train h_proj and h_norm layers
-            ext_hs = self.h_norm(self.h_proj(ext_hs))
+            # re-project retrieved values (full size hidden states)
+            # to train h_proj and h_norm layers
+            retrieved_hs = self.h_norm(self.h_proj(retrieved_hs))
 
         # Store retrieved states for attention in following layers
-        self.retrieval_state["ext_hidden_states"] = ext_hs
+        self.retrieval_state["retrieved_hidden_states"] = retrieved_hs
 
-        # 2. Update cache with new hidden states
-        if self.update_cache:
-            # If training keep both projected and original hidden states
-            # to train the h_proj and h_norm layers, otherwise keep only
-            # projected hidden states
-            if self.should_reencode():
-                self.caches[idx].update(phs, hs.to(self.cache_dtype), input_mask)
-            else:
-                self.caches[idx].update(phs, None, input_mask)
+    def update_hook(self, module, args, kwargs, outputs, idx):
+        """Update the cache with the new hidden states."""
+        if not self.enabled or not self.update_cache:
+            return
+
+        hs = kwargs["hidden_states"].detach()
+        batch_size, seq_len, _ = hs.shape
+
+        # Infer padding mask from attention mask
+        if kwargs.get("attention_mask") is not None and False:
+            input_mask = kwargs["attention_mask"].detach().to(torch.bool)
+            input_mask = input_mask.all(axis=-1).reshape(batch_size, seq_len).logical_not()
+        else:
+            input_mask = None
+
+        # Project hidden states to lower dimension and normalize these
+        # will be used as queries for the cache and as values to be
+        # stored in the cache. This is always done without gradients,
+        # even during training since we do not backpropagate through the cache.
+        with torch.no_grad():
+            # TODO: if the same layer is used for retrieval and update, we can
+            # avoid encoding the hidden states twice.
+            projected_hs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
+
+        if self.should_reencode():
+            # Store both projected and original hidden states
+            self.caches[idx].update(projected_hs, hs.to(self.cache_dtype), input_mask)
+        else:
+            # Store only projected hidden states
+            self.caches[idx].update(projected_hs, None, input_mask)

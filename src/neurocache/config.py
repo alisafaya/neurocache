@@ -182,6 +182,8 @@ class NeurocacheConfig(NeurocacheConfigMixin):
             If `None`, the layer with idx == `num_layers * 3 // 4` is used.
         attention_layers (`list`, defaults to `None`): Layers to use for attention.
             If `None`, the layers with idx >= `num_layers * 3 // 4` are used.
+        retrieval_layers (`list`, defaults to `None`): Layers to use for retrieval.
+            If `None`, cache_layers are used.
     """
 
     base_model_name_or_path: str = field(
@@ -200,3 +202,4 @@ class NeurocacheConfig(NeurocacheConfigMixin):
     context_size: int = field(default=2, metadata={"help": "Size of attention context window"})
     cache_layers: list = field(default=None, metadata={"help": "Layers to store in cache"})
     attention_layers: list = field(default=None, metadata={"help": "Layers to use for attention"})
+    retrieval_layers: list = field(default=None, metadata={"help": "Layers to use for retrieval"})
