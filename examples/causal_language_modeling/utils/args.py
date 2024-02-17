@@ -13,11 +13,11 @@ def parse_args():
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--eval_split", type=str, default="validation")
     parser.add_argument("--test_split", type=str, default="test")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=4)
     parser.add_argument("--sequence_length", type=int, default=1024)
-    parser.add_argument("--max_train_steps", type=int, default=10000)
-    parser.add_argument("--max_eval_steps", type=int, default=500)
+    parser.add_argument("--max_train_steps", type=int, default=25000)
+    parser.add_argument("--max_eval_steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=1234567)
 
     # Training arguments
@@ -30,7 +30,7 @@ def parse_args():
 
     # This needs to be > 1 for stable training, otherwuse the model will diverge
     # due to distibutional shift between the cache and the model.
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--evaluate_every_steps", type=int, default=500)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument(
@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument("--disable_neurocache", action="store_true")
     parser.add_argument("--attention_layers", type=str, default=None)
     parser.add_argument("--cache_layers", type=str, default=None)
-    parser.add_argument("--cache_size", type=int, default=16384)
+    parser.add_argument("--cache_size", type=int, default=32768)
     parser.add_argument("--cache_type", type=str, default="FIFO", choices=["FIFO", "LRU"])
     parser.add_argument(
         "--cache_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"]
@@ -74,8 +74,8 @@ def parse_args():
 
     # LoRA arguments
     parser.add_argument("--disable_lora", action="store_true")
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--lora_modules", type=str, default="gate_proj,up_proj,down_proj")
 

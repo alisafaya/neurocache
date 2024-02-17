@@ -185,7 +185,10 @@ def initialize_model(args, accelerator):
         else:
             logger.info(f"Loading neurocache from {args.pretrained_neurocache}")
             model = NeurocacheModelForCausalLM.from_pretrained(
-                model, args.pretrained_neurocache, cache_type="ONDEVICE", is_training=True
+                model, 
+                args.pretrained_neurocache, 
+                cache_type="ONDEVICE",
+                is_trainable=True
             )
         model = model.to(accelerator.device)
 
