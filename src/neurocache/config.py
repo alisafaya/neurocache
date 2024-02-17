@@ -178,12 +178,10 @@ class NeurocacheConfig(NeurocacheConfigMixin):
         topk (`int`, defaults to 32): The number of neighbors to retrieve.
         neighborhood_size (`int`, defaults to 2): Size of retrieved neighborhood.
         context_size (`int`, defaults to 2): Size of attention context window.
-        cache_layers (`list`, defaults to `None`): Layers to store in cache.
-            If `None`, the layer with idx == `num_layers * 3 // 4` is used.
+        retrieval_map (`Dict[int, int]`, defaults to `None`): Layers to retrieve and store cache.
+            This is a dictionary with keys as the retrieving layer indices and values as the storing layer indices. 
         attention_layers (`list`, defaults to `None`): Layers to use for attention.
             If `None`, the layers with idx >= `num_layers * 3 // 4` are used.
-        retrieval_layers (`list`, defaults to `None`): Layers to use for retrieval.
-            If `None`, cache_layers are used.
     """
 
     base_model_name_or_path: str = field(
@@ -200,6 +198,11 @@ class NeurocacheConfig(NeurocacheConfigMixin):
     topk: int = field(default=32, metadata={"help": "The number of neighbors to retrieve"})
     neighborhood_size: int = field(default=2, metadata={"help": "Size of retrieved neighborhood"})
     context_size: int = field(default=2, metadata={"help": "Size of attention context window"})
-    cache_layers: list = field(default=None, metadata={"help": "Layers to store in cache"})
+    retrieval_map: Dict[int, int] = field(default=None, metadata={"help": "Layers to retrieve and store cache"})
     attention_layers: list = field(default=None, metadata={"help": "Layers to use for attention"})
-    retrieval_layers: list = field(default=None, metadata={"help": "Layers to use for retrieval"})
+
+    def __post_init__(self):
+        if self.retrieval_map is not None:
+            assert isinstance(self.retrieval_map, dict)
+            # convert string keys to int
+            self.retrieval_map = {int(k): int(v) for k, v in self.retrieval_map.items()}

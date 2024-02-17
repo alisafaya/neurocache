@@ -332,7 +332,7 @@ class NeurocacheModelForCausalLM(NeurocacheModel):
         ...     "inference_mode": False,
         ...     "cache_size": 16384,
         ...     "compression_factor": 4,
-        ...     "cache_layers": [30],
+        ...     "retrieval_map": {30: 30},
         ...     "attention_layers": [30, 31, 32, 33, 34, 35],
         ... }
 

@@ -8,7 +8,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from neurocache.utils import COMMON_MODULE_NAMES, NeurocacheType
 
-from .cache import BatchedCache, OnDeviceCache
+from .cache import BatchedCache, OnDeviceCache, OnDeviceCacheConfig
 from .config import NeurocacheConfig
 
 
@@ -228,7 +228,7 @@ class Neurocache(nn.Module):
     def __init__(
         self,
         base_model: PreTrainedModel,
-        config: NeurocacheConfig,
+        config: OnDeviceCacheConfig,
     ):
         super().__init__()
         self.config = config
@@ -307,8 +307,8 @@ class Neurocache(nn.Module):
         for cache in self.caches:
             cache.wrapped = None
 
-    def _register_hooks(self, base_model: PreTrainedModel):
-        # Infer decoder layer list
+    def infer_layers(self, base_model: PreTrainedModel):
+        """Infer the layers list of the base model."""
         if hasattr(base_model, "base_model"):
             base_model = base_model.model
 
@@ -324,56 +324,67 @@ class Neurocache(nn.Module):
         except AttributeError:
             raise AttributeError("Cannot infer decoder layers.")
 
-        if self.config.cache_layers is None or len(self.config.cache_layers) == 0:
-            cache_idx = num_layers * 3 // 4
-            cache_layers = [cache_idx]
-            self.config.cache_layers = cache_layers
-        else:
-            cache_layers = self.config.cache_layers
+        return layers, num_layers
 
-        if self.config.retrieval_layers is None or len(self.config.retrieval_layers) == 0:
-            # if retrieval layers are not specified, use cache layers
-            retrieval_layers = cache_layers
+    def get_layer_indices(self, num_layers: int):
+        """Get the cache, retrieval, and attention layers indices."""
+
+        if self.config.retrieval_map is None or len(self.config.retrieval_map) == 0:
+            cache_idx = num_layers * 3 // 4
+            retrieval_map = {cache_idx: cache_idx}
         else:
-            retrieval_layers = self.config.retrieval_layers
+            retrieval_map = self.config.retrieval_map
 
         if self.config.attention_layers is None or len(self.config.attention_layers) == 0:
-            attention_layers = list(range(min(cache_layers), num_layers))
+            attention_layers = list(range(min(retrieval_map.keys()), num_layers))
             self.config.attention_layers = attention_layers
         else:
             attention_layers = self.config.attention_layers
 
         # Check that cache layers are before attention layers
-        assert min(attention_layers) >= min(cache_layers)
+        assert min(attention_layers) >= min(
+            retrieval_map.keys()
+        ), "Attention layers must be greater than or equal to retrieval layers"
+        return retrieval_map, sorted(set(attention_layers))
 
-        # Initialize caches for storing hidden states
-        for _ in cache_layers:
-            split_dims = () if self.config.global_cache else (0,)
-            self.caches.append(BatchedCache(None, split_dims))
+    def _register_hooks(self, base_model: PreTrainedModel):
+        """Register hooks for cache retrieval, attention, and cache updates."""
+        layers, num_layers = self.infer_layers(base_model)
+        retrieval_map, attention_layers = self.get_layer_indices(num_layers)
 
         # Initialize cache attention layers
-        for idx in sorted(attention_layers):
+        for idx in attention_layers:
             self.cache_attns.append(
                 CacheAttention(layers[idx], self.config, self.base_model_config)
             )
 
-        # Register cache retrieval hooks
+        layer_idx2cache_idx = {v: k for k, v in enumerate(sorted(set(retrieval_map.values())))}
+
+        # Register retrieval hooks
         hooks = []
-        for i, idx in enumerate(sorted(retrieval_layers)):
-            hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
-                functools.partial(self.retrieve_hook, idx=i), prepend=True, with_kwargs=True
+        for retrieval_idx, cachelayer_idx in retrieval_map.items():
+            hook = get_attribute(layers[retrieval_idx], "self_attn").register_forward_hook(
+                functools.partial(self.retrieve_hook, idx=layer_idx2cache_idx[cachelayer_idx]),
+                prepend=True,
+                with_kwargs=True,
             )
             hooks.append(hook)
 
-        # Register cache update hooks
-        for i, idx in enumerate(sorted(cache_layers)):
-            hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
-                functools.partial(self.update_hook, idx=i), with_kwargs=True
+        # Register cache updates hooks
+        split_dims = () if self.config.global_cache else (0,)
+        for layer_idx, cache_idx in layer_idx2cache_idx.items():
+            # Create batched caches as many as the number of unique cache indices
+            # We initialize the cache in the first forward pass to infer batch size
+            # and start retrieval in the next passes.
+            self.caches.append(BatchedCache(None, split_dims))
+
+            hook = get_attribute(layers[layer_idx], "self_attn").register_forward_hook(
+                functools.partial(self.update_hook, idx=cache_idx), with_kwargs=True
             )
             hooks.append(hook)
 
         # Register cache attention hooks
-        for i, idx in enumerate(sorted(attention_layers)):
+        for i, idx in enumerate(attention_layers):
             hook = get_attribute(layers[idx], "self_attn").register_forward_hook(
                 functools.partial(self.attention_hook, idx=i), with_kwargs=True
             )
@@ -429,7 +440,7 @@ class Neurocache(nn.Module):
         # stored in the cache. We detach since we do not backpropagate
         # through the cache. No gradients are computed during retrieval.
         with torch.no_grad():
-            projected_hs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
+            projected_hs = self.h_norm(self.h_proj(hs)).to(self.cache_dtype)
 
         # Since we need to infer the batch size before initializing
         # the cache we initialize the cache in the first forward pass
@@ -440,6 +451,7 @@ class Neurocache(nn.Module):
         ):
             value_dim = hidden_size if self.should_reencode() else 0
 
+            # TODO: Just pass OnDeviceCacheConfig instead of individual args
             self.caches[idx].wrapped = OnDeviceCache(
                 batch_size,
                 self.config.cache_size,
@@ -471,6 +483,7 @@ class Neurocache(nn.Module):
             keys, values = self.retrieve_topk(projected_hs, input_mask, idx)
             retrieved_hs = values if self.should_reencode() else keys
             assert retrieved_hs is not None, "Retrieved cache is None"
+            # This is no-op if dtype is the same
             retrieved_hs = retrieved_hs.to(hs.dtype)
 
         if self.should_reencode():
@@ -503,7 +516,7 @@ class Neurocache(nn.Module):
         with torch.no_grad():
             # TODO: if the same layer is used for retrieval and update, we can
             # avoid encoding the hidden states twice.
-            projected_hs = self.h_norm(self.h_proj(hs)).detach().to(self.cache_dtype)
+            projected_hs = self.h_norm(self.h_proj(hs)).to(self.cache_dtype)
 
         if self.should_reencode():
             # Store both projected and original hidden states

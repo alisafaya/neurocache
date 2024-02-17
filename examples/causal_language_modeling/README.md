@@ -1,9 +1,4 @@
-
-```
-Pretrain a neurocache model on a causal language modeling task
-
-
-```
+Train neurocache weights for huggingface models.
 
 Example:
 
@@ -52,18 +47,65 @@ accelerate launch \
 
 | Model                 | LP     | LRP    | PG19   |
 | ----------------------| -------| ------ | ------ |
-| opt-1.3b              | 16.872 | 19.446 | 25.859 | !!!
-| opt-1.3b - 16k        | 14.764 | 17.377 | - |
+| opt-1.3b              | 16.872 | 19.446 | 25.859 |
+| opt-1.3b - 16k        | 14.764 | 17.626 | ------ |
+| opt-1.3b - 128k       | 14.711 | 17.377 | ------ |
 | opt-1.3b - lora       | 16.575 | 19.114 | 12.199 |
 | opt-1.3b - 16k+lora   | 14.726 | 17.608 | 11.306 |
 | opt-1.3b - 128k+lora  | 14.674 | 17.360 | 11.227 |
  
 ---
 
-| Model                 | LP    | LRP   | PG19  |
-| ----------------------| ----- | ----- | ----- |
-| llama2-7b             | 8.102 | 9.075 | 7.359 |
-| llama2-7b - 16k       | 7.538 | 8.616 | - |
-| llama2-7b - lora      | 7.986 | 8.956 | 7.073 |
-| llama2-7b - 16k+lora  | 7.454 | 8.589 | 6.844 |
-| llama2-7b - 128k+lora | 7.424 | 8.517 | 6.822 |
+`seq_len=2048`
+
+| Model                 | LP     |
+| ----------------------| -------|
+| opt-1.3b              | 15.649 |
+| opt-1.3b - 16k - 512  | 14.263 | 
+| opt-1.3b - 16k - 1024 | 14.240 | 
+| opt-1.3b - 16k - 2048 | 14.617 |
+
+`seq_len=4096`
+
+| Model                 | LRP   |
+| ----------------------| ------|
+| llama2-7b             | 8.140 |
+| llama2-7b - 16k       | 7.915 |
+| llama2-7b - 128k      | 7.853 |
+
+---
+
+| Model                   | LP     | LRP   | PG19  |
+| ----------------------- | ------ | ----- | ----- |
+| llama2-7b               | 8.102  | 9.075 | 7.359 |
+| llama2-7b - lora        | 7.986  | 8.956 | 7.073 |
+| llama2-7b - 16k         | 7.393  | 8.451 | ----- |
+| llama2-7b - 128k        | 7.360  | 8.363 | ----- |
+| llama2-7b - 16k+lora    | 7.345  | 8.435 | 7.117 |
+| llama2-7b - 128k+lora   | 7.312  | 8.347 | 7.078 |
+| llama2-7b - 2*16k+lora  | -      | 8.307 | 7.003 |
+| llama2-7b - 2*128k+lora | -      | 8.219 | 6.959*|
+
+(*) Evaluate using model trained on LP instead of PG19.
+
+| Model                   |  LRP   | PG19  |
+| ----------------------- | ------ | ----- |
+| mistral-7b              | 9.380  | 7.863 |
+| mistral-7b - 16k+lora   | 8.581  | 7.684*|
+| mistral-7b - 128k+lora  | 8.493  | 7.636*|
+
+---
+
+Cache ordering: llama2-7b - 16k
+
+| Order                     | LRP   |
+| ------------------------- | ----- |
+| FIFO/training - FIFO/test | 8.451 |
+| FIFO/training - LRU/test  | 8.508 |
+
+
+
+| default   | 8.581 |
+| topk = 32 | 8.573 |
+| w = 4     | 8.592 |
+| c = 4     | |

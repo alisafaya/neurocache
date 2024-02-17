@@ -88,7 +88,7 @@ def prevent_full_backward_pass(_model):
     # checkpoint = functools.partial(checkpoint, use_reentrant=False)
 
     neurocache_config = _model.base_cache.config
-    bottom_layer_idx = min(neurocache_config.attention_layers + neurocache_config.cache_layers)
+    bottom_layer_idx = min(neurocache_config.attention_layers + neurocache_config.retrieval_map)
 
     if hasattr(_model, "base_model"):
         _model = _model.model
@@ -136,15 +136,15 @@ def initialize_model(args, accelerator):
         model = prepare_model_for_kbit_training(model)
 
     # Set up the neurocache config and wrap the model with the neurocache model.
-    if args.cache_layers is not None:
-        cache_layers = [int(x) for x in args.cache_layers.split(",")]
+    if args.retrieval_map is not None:
+        retrieval_map = eval(args.retrieval_map)
     else:
-        cache_layers = [model.config.num_hidden_layers * 3 // 4]
+        retrieval_map = None
 
     if args.attention_layers is not None:
         attention_layers = [int(x) for x in args.attention_layers.split(",")]
     else:
-        attention_layers = list(range(min(cache_layers), model.config.num_hidden_layers))
+        attention_layers = None
 
     if not args.disable_lora:
         # Apply LoRA to the main model to adapt it to using neurocache.
@@ -169,7 +169,7 @@ def initialize_model(args, accelerator):
         if not args.pretrained_neurocache:
             neurocache_config = OnDeviceCacheConfig(
                 attention_layers=attention_layers,
-                cache_layers=cache_layers,
+                retrieval_map=retrieval_map,
                 cache_size=args.cache_size,
                 cache_dtype=args.cache_dtype,
                 compression_factor=args.compression_factor,

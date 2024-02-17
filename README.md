@@ -47,9 +47,9 @@ config = OnDeviceCacheConfig(
 
 model = NeurocacheModelForCausalLM(model, config)
 
-input_text = ["Hello, my dog is cute", "Hello, my cat is cute"]
+input_text = ["Hello, my dog is cute", " is cute"]
 tokenized_input = tokenizer(input_text, return_tensors="pt")
-tokenized_input["start_of_sequence"] = torch.tensor([0, 1]).bool()
+tokenized_input["start_of_sequence"] = torch.tensor([1, 0]).bool()
 
 outputs = model(**tokenized_input)
 ```

@@ -60,8 +60,8 @@ def parse_args():
     # Neurocache arguments
     parser.add_argument("--pretrained_neurocache", type=str, default=None)
     parser.add_argument("--disable_neurocache", action="store_true")
+    parser.add_argument("--retrieval_map", type=str, default=None)
     parser.add_argument("--attention_layers", type=str, default=None)
-    parser.add_argument("--cache_layers", type=str, default=None)
     parser.add_argument("--cache_size", type=int, default=32768)
     parser.add_argument("--cache_type", type=str, default="FIFO", choices=["FIFO", "LRU"])
     parser.add_argument(
