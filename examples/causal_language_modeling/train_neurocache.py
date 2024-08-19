@@ -9,6 +9,10 @@ import os
 import shutil
 
 import tensorflow.compat.v2 as tf
+
+# Make sure that tensorflow is not reserving GPUs.
+tf.config.experimental.set_visible_devices([], "GPU")
+
 import torch
 import transformers
 from accelerate import Accelerator
@@ -29,11 +33,6 @@ from utils.args import parse_args
 
 from neurocache import NeurocacheModelForCausalLM, OnDeviceCacheConfig
 from neurocache.neurocache import get_attribute
-
-
-# Make sure that tensorflow is not reserving GPUs.
-tf.config.experimental.set_visible_devices([], "GPU")
-
 
 logger = get_logger(__name__)
 
@@ -88,7 +87,7 @@ def prevent_full_backward_pass(_model):
     # checkpoint = functools.partial(checkpoint, use_reentrant=False)
 
     neurocache_config = _model.base_cache.config
-    bottom_layer_idx = min(neurocache_config.attention_layers + neurocache_config.retrieval_map)
+    bottom_layer_idx = min(neurocache_config.attention_layers + list(neurocache_config.retrieval_map.keys()))
 
     if hasattr(_model, "base_model"):
         _model = _model.model
@@ -139,7 +138,7 @@ def initialize_model(args, accelerator):
     if args.retrieval_map is not None:
         retrieval_map = eval(args.retrieval_map)
     else:
-        retrieval_map = None
+        retrieval_map = {}
 
     if args.attention_layers is not None:
         attention_layers = [int(x) for x in args.attention_layers.split(",")]
@@ -195,7 +194,7 @@ def initialize_model(args, accelerator):
     if args.disable_grad_checkpointing:
         model.base_model.gradient_checkpointing_disable()
     else:
-        model.base_model.gradient_checkpointing_enable()
+        model.base_model.gradient_checkpointing_enable({"use_reentrant": False})
         model.base_model.enable_input_require_grads()
         prevent_full_backward_pass(model)
 
