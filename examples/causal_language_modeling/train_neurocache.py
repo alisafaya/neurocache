@@ -147,13 +147,11 @@ def initialize_model(args, accelerator):
 
     if not args.disable_lora:
         # Apply LoRA to the main model to adapt it to using neurocache.
-        lora_layers = attention_layers
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             target_modules=args.lora_modules.split(","),
             lora_dropout=args.lora_dropout,
-            layers_to_transform=lora_layers,
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -196,7 +194,7 @@ def initialize_model(args, accelerator):
     else:
         model.base_model.gradient_checkpointing_enable({"use_reentrant": False})
         model.base_model.enable_input_require_grads()
-        prevent_full_backward_pass(model)
+        # prevent_full_backward_pass(model)
 
     print_trainable_parameters(model, accelerator)
     return model

@@ -36,6 +36,7 @@ NEUROCACHE_SUPPORTED_MODELS = [
     "llama",
     "mistral",
     "gptj",
+    "phi"
 ]
 
 COMMON_MODULE_NAMES = {
@@ -44,7 +45,7 @@ COMMON_MODULE_NAMES = {
     "num_kv_heads": ["num_key_value_heads"],
     "hidden_size": ["hidden_size", "d_model", "embed_dim"],
     "self_attn": ["self_attention", "self_attn", "attn", "dec_attn"],
-    "o_proj": ["o_proj", "out_proj", "output_proj", "output_projection"],
+    "o_proj": ["o_proj", "out_proj", "output_proj", "output_projection", "dense"],
     "q_proj": ["q_proj", "query_proj", "query_projection"],
     "k_proj": ["k_proj", "key_proj", "key_projection"],
     "v_proj": ["v_proj", "value_proj", "value_projection"],
