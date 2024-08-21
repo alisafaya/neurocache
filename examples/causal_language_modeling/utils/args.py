@@ -50,7 +50,7 @@ def parse_args():
     # Output arguments
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--resume_from_checkpoint", type=str, default="")
-    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--checkpointing_steps", type=int, default=2000)
     parser.add_argument("--keep_n_checkpoints", type=int, default=2)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--report_to", type=str, default="tensorboard")
@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument("--disable_neurocache", action="store_true")
     parser.add_argument("--retrieval_map", type=str, default=None)
     parser.add_argument("--attention_layers", type=str, default=None)
-    parser.add_argument("--cache_size", type=int, default=32768)
+    parser.add_argument("--cache_size", type=int, default=16384)
     parser.add_argument("--cache_type", type=str, default="FIFO", choices=["FIFO", "LRU"])
     parser.add_argument(
         "--cache_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"]

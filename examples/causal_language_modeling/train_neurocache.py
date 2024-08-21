@@ -1,11 +1,6 @@
-"""
-Fine-tuning the library models for causal language modeling (llama, opt, ...)
-on a text file or a dataset without using HuggingFace Trainer.
-"""
-
+import os
 import logging
 import math
-import os
 import shutil
 
 import tensorflow.compat.v2 as tf
@@ -62,7 +57,7 @@ def init_neurocache_weights_(args, neurocache):
     del _model
 
 
-def prevent_full_backward_pass(_model):
+def prevent_full_backward_pass(_model, bottom_layer_idx):
     """
     Allow gradient checkpointing while preventing full backward pass on the model.
     """
@@ -85,9 +80,6 @@ def prevent_full_backward_pass(_model):
     # from torch.utils.checkpoint import checkpoint
     # Add this line:
     # checkpoint = functools.partial(checkpoint, use_reentrant=False)
-
-    neurocache_config = _model.base_cache.config
-    bottom_layer_idx = min(neurocache_config.attention_layers + list(neurocache_config.retrieval_map.keys()))
 
     if hasattr(_model, "base_model"):
         _model = _model.model
@@ -126,8 +118,8 @@ def initialize_model(args, accelerator):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         config=config,
-        quantization_config=quant_config,
-        torch_dtype=getattr(torch, args.cache_dtype) if not args.nf4 else None,
+        quantization_config=quant_config
+        # torch_dtype=getattr(torch, args.cache_dtype) if not args.nf4 else None,
     )
 
     # Prepare the model for kbit training.
@@ -150,6 +142,7 @@ def initialize_model(args, accelerator):
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
+            layers_to_transform=attention_layers,
             target_modules=args.lora_modules.split(","),
             lora_dropout=args.lora_dropout,
             bias="none",
@@ -194,7 +187,8 @@ def initialize_model(args, accelerator):
     else:
         model.base_model.gradient_checkpointing_enable({"use_reentrant": False})
         model.base_model.enable_input_require_grads()
-        # prevent_full_backward_pass(model)
+        bottom_layer_idx = min(attention_layers + list(retrieval_map.keys()))
+        prevent_full_backward_pass(model, bottom_layer_idx)
 
     print_trainable_parameters(model, accelerator)
     return model
@@ -341,10 +335,13 @@ def main():
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
 
+    from accelerate.utils import DistributedDataParallelKwargs
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         dispatch_batches=True,
         split_batches=True,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=not args.disable_neurocache)],
         **accelerator_log_kwargs,
     )
 
